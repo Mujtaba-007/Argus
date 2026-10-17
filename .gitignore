@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+argus_session.session
+firebase-key.json
+*.session
