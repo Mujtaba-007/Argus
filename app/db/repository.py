@@ -31,6 +31,19 @@ def get_active_trackers() -> list[dict[str, Any]]:
 
 
 @_db_retry
+def get_tracker(tracker_id: str) -> dict[str, Any] | None:
+    """Return a single tracker by ID, or None if not found."""
+    result = (
+        supabase.table("trackers")
+        .select("*")
+        .eq("id", tracker_id)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+@_db_retry
 def update_tracker_last_sync(tracker_id: str, synced_at: datetime) -> None:
     """Update last_sync_at timestamp for a tracker."""
     supabase.table("trackers").update(

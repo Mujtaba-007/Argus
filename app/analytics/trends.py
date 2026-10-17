@@ -47,7 +47,7 @@ RANGE_CONFIGS = [
     ("30D", 720, 72),  # 30 days lookback, 10 windows of 72 hours
 ]
 
-_MAX_POSTS_PER_RANGE = 5_000
+_MAX_POSTS_PER_RANGE = 3_000
 
 
 def _clean_text(text: str) -> str:
@@ -65,12 +65,12 @@ def _analyze_range(
 ) -> list[dict[str, Any]]:
     """
     Compute trend metrics for a specific time range using vectorized counts.
-    Caps to the newest 5 000 posts. Returns trend dicts with volume >= 3.
+    Caps to the newest 3 000 posts. Returns trend dicts with volume >= 3.
     """
     if not valid_posts:
         return []
 
-    # Cap to newest 5 000 posts (already sorted desc in analyze_trends, but guard here)
+    # Cap each range at 3 000 posts before TF-IDF
     if len(valid_posts) > _MAX_POSTS_PER_RANGE:
         valid_posts = valid_posts[:_MAX_POSTS_PER_RANGE]
 
@@ -229,7 +229,7 @@ def _analyze_range(
     return top_terms
 
 
-async def analyze_trends(tracker_id: str) -> dict[str, Any]:
+def analyze_trends(tracker_id: str) -> dict[str, Any]:
     """
     Compute and store trends for a tracker for 24H, 7D, and 30D ranges.
     Fetches 30D data ONCE and filters in memory for each range.

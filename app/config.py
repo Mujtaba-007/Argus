@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # X API credentials
     x_api_key: str = ""
     x_api_secret: str = ""
+    # X ingestion controls
+    X_MIN_INTERVAL_MINUTES: int = 60
+    X_MAX_RESULTS: int = 10
+    X_ENABLED: bool = True
 
     # Supabase connection details
     supabase_url: str

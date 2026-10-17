@@ -18,25 +18,27 @@ _db_retry = retry(
 
 
 @_db_retry
-def get_posts_for_trends(tracker_id: str, since_iso: str) -> list[dict[str, Any]]:
-    """Fetch posts from the lookback period for trend analysis using paged fetching."""
+def get_posts_for_trends(tracker_id: str, since_iso: str, limit: int = 5000) -> list[dict[str, Any]]:
+    """Fetch newest posts (up to limit) from the lookback period for trend analysis ordered desc."""
     page_size = 1000
     all_posts: list[dict[str, Any]] = []
     start = 0
-    while True:
+    while len(all_posts) < limit:
+        fetch_count = min(page_size, limit - len(all_posts))
         res = (
             supabase.table("posts")
             .select("body, posted_at")
             .eq("tracker_id", tracker_id)
             .gte("posted_at", since_iso)
-            .range(start, start + page_size - 1)
+            .order("posted_at", desc=True)
+            .range(start, start + fetch_count - 1)
             .execute()
         )
         batch = res.data or []
         all_posts.extend(batch)
-        if len(batch) < page_size:
+        if len(batch) < fetch_count:
             break
-        start += page_size
+        start += fetch_count
     return all_posts
 
 
