@@ -49,6 +49,7 @@ CUSTOM_STOP_WORDS = {
     "koi", "aaya", "aaye", "aayi", "aya", "aye", "ayi", "kuch", "sab", "apna", "apni", "apne",
     "fir", "phir", "abhi", "aisa", "aise", "aisi",
     "apka", "mujhe", "kiya",
+    "isliye", "pta", "kis", "sahi", "krta", "karta", "kisi",
 }
 
 # Combined set of all stop words (English + Custom), including normalized forms
@@ -194,8 +195,16 @@ def _analyze_range(
         if total_range_vol < 3:
             continue
         words = term.split()
+        # Lowercase + strip punctuation each token before checking, in case any
+        # non-alpha character survived TF-IDF tokenization.
         # Drop if any constituent word is in ALL_STOP_WORDS, shorter than 3 chars, or digit-only
-        if any(w in ALL_STOP_WORDS or len(w) < 3 or w.isdigit() for w in words):
+        if any(
+            (w_clean := re.sub(r"[^a-z]", "", w.lower())) in ALL_STOP_WORDS
+            or len(w_clean) < 3
+            or w_clean.isdigit()
+            or w_clean == ""
+            for w in words
+        ):
             continue
         v_curr = float(curr_window_counts[col_idx])
         v_prev_avg = float(prev_avg[col_idx])
