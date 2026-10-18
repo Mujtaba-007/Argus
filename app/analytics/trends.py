@@ -35,21 +35,66 @@ def _normalize_word(word: str) -> str:
 
 
 CUSTOM_STOP_WORDS = {
-    # Web / platform noise
-    "amp", "rt", "http", "https", "com", "co", "t", "telegram", "channel", "group", "zone",
-    "live", "user", "id", "user_id",
-    # Hindi / Hinglish stopwords & requested conversational noise
-    "ka", "ki", "ke", "ko", "hai", "h", "hain", "kab", "kya", "kaise", "kese",
-    "nahi", "nhi", "ho", "hoga", "gya", "to", "toh", "bhi", "me", "mein", "se",
-    "ye", "yeh", "wo", "woh", "aur", "ya", "par", "pe", "na", "ek",
-    "bhai", "bro", "sir", "please", "pls", "ok", "okay", "hi", "ha", "haan",
-    "ji", "kr", "kar", "jo", "ab", "mera", "meri", "mere", "dekho", "abe", "saale",
-    "tk", "tak", "lia", "liya", "liye", "respond", "tell", "got", "tha", "thi",
-    "rha", "raha", "rhi", "rahi", "dikha", "dur", "itna", "city", "intimation", "diya",
-    "koi", "aaya", "aaye", "aayi", "aya", "aye", "ayi", "kuch", "sab", "apna", "apni", "apne",
-    "fir", "phir", "abhi", "aisa", "aise", "aisi",
+    # ── Web / platform noise ─────────────────────────────────────────────────
+    "amp", "rt", "http", "https", "com", "co", "t", "telegram",
+    "channel", "group", "zone", "live", "user", "id", "user_id",
+    "admin", "bot",
+
+    # ── Pronouns & Demonstratives ────────────────────────────────────────────
+    "maine", "tumne", "usne", "humne", "unhone", "inhone", "isne",
+    "jisne", "mera", "meri", "mere", "tera", "teri", "tere",
+    "uska", "uski", "uske", "inka", "inki", "inke", "unka", "unki", "unke",
+    "apna", "apni", "apne", "apka", "apki", "apke",
+    "mujhe", "tujhe", "unhe", "inhe",
+    "kisi", "kisse", "jisse", "jo", "jin", "jinhone",
+    "sab", "sabhi", "kuch", "koi",
+    "ye", "yeh", "wo", "woh", "ek",
+
+    # ── Verbs & Auxiliaries ──────────────────────────────────────────────────
+    "rhe", "rha", "rhi", "raha", "rahi", "rahe",
+    "ho", "hai", "hain", "hoga", "honge", "hangi",
+    "tha", "thi", "the",
+    "karo", "karna", "karke", "karne",
+    "kiya", "diya", "liya", "le", "de",
+    "aaya", "aaye", "aayi", "aya", "aye", "ayi",
+    "gaya", "gaye", "gya", "gye",
+    "bolo", "bol", "pucho", "batao",
+    "sakta", "sakti", "sakte",
+    "karta", "karti", "karte", "krta", "krti", "krte",
+    "kar", "kr", "lia", "liye", "gyi",
+
+    # ── Conjunctions & Prepositions ──────────────────────────────────────────
+    "isliye", "kyunki", "lekin",
+    "par", "aur", "ya", "to", "toh",
+    "tak", "tk", "pe", "se", "me", "mein",
+    "bhi", "hi",
+    "wala", "wali", "wale", "wal",
+    "ne", "ko", "ka", "ki", "ke", "ab", "na",
+
+    # ── Chat Fillers & Questions ─────────────────────────────────────────────
+    "abe", "saale", "bhai", "sir", "ji", "bro",
+    "yr", "yaar",
+    "pls", "please", "hmm", "hmmm",
+    "ok", "okay", "haan", "ha", "haan",
+    "nahi", "nhi", "na", "naa",
+    "ur", "gd",
+    "pta", "pata", "sahi", "galat",
+    "kya", "kab", "kahan", "kaise", "kese", "kyun",
+    "kis", "kon", "kaun",
+    "abhi", "fir", "phir",
+    "aisa", "aise", "aisi",
+    "dekho", "dikha", "itna", "dur",
+    "tha", "thi", "ek",
+
+    # ── Legacy / previously observed leakage ─────────────────────────────────
+    "h", "hain", "ha", "hoga", "intimation", "city",
+    "respond", "tell", "got", "zone", "live",
+    "tak", "lia", "diya", "rha", "rhi",
+    "koi", "aaya", "kuch", "sab",
+    "fir", "phir", "aisa",
     "apka", "mujhe", "kiya",
     "isliye", "pta", "kis", "sahi", "krta", "karta", "kisi",
+    "maine", "mujhe", "tumhe", "usse", "inse", "unse",
 }
 
 # Combined set of all stop words (English + Custom), including normalized forms
