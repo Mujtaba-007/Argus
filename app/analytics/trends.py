@@ -95,7 +95,54 @@ CUSTOM_STOP_WORDS = {
     "apka", "mujhe", "kiya",
     "isliye", "pta", "kis", "sahi", "krta", "karta", "kisi",
     "maine", "mujhe", "tumhe", "usse", "inse", "unse",
+    "dega", "degi", "denge", "din", "dino", "dono",
+    "babu", "kha", "mila", "mile", "mili",
 }
+
+# Domain-specific terms & acronyms to always allow even if not in standard English dictionary
+DOMAIN_WHITELIST: set[str] = {
+    "rrb", "ssc", "ntpc", "cbt", "cbt1", "cbt2", "pnr", "alp", "loco", "groupd",
+    # Common financial / crypto / business acronyms & terms for other Argus trackers
+    "usdt", "inr", "p2p", "fno", "nifty", "banknifty", "ipo", "etf", "sip",
+}
+
+# Fast English dictionary loader (bundled gzipped word list with fallback)
+_ENGLISH_WORDS_CACHE: set[str] | None = None
+
+
+def _get_english_words() -> set[str]:
+    """Load English words dictionary from bundled data or fallback."""
+    global _ENGLISH_WORDS_CACHE
+    if _ENGLISH_WORDS_CACHE is not None:
+        return _ENGLISH_WORDS_CACHE
+
+    import gzip
+    from pathlib import Path
+
+    dict_path = Path(__file__).resolve().parent / "data" / "words.txt.gz"
+    if dict_path.is_file():
+        try:
+            with gzip.open(dict_path, "rt", encoding="utf-8") as f:
+                _ENGLISH_WORDS_CACHE = {line.strip().lower() for line in f if line.strip()}
+            return _ENGLISH_WORDS_CACHE
+        except Exception as exc:
+            logger.warning("Failed to load bundled words dictionary: %s", exc)
+
+    # Fallback to English stop words and basic set if file is unavailable
+    _ENGLISH_WORDS_CACHE = set(ENGLISH_STOP_WORDS)
+    return _ENGLISH_WORDS_CACHE
+
+
+def _is_valid_word(word: str) -> bool:
+    """Check if a word is in DOMAIN_WHITELIST or a valid English dictionary word."""
+    w = word.lower()
+    if w in DOMAIN_WHITELIST:
+        return True
+    dict_words = _get_english_words()
+    if not dict_words:
+        return True
+    return w in dict_words or _normalize_word(w) in dict_words
+
 
 # Combined set of all stop words (English + Custom), including normalized forms
 ALL_STOP_WORDS = {
@@ -243,13 +290,20 @@ def _analyze_range(
         # Lowercase + strip punctuation each token before checking, in case any
         # non-alpha character survived TF-IDF tokenization.
         # Drop if any constituent word is in ALL_STOP_WORDS, shorter than 3 chars, or digit-only
+        cleaned_words = [re.sub(r"[^a-z]", "", w.lower()) for w in words]
         if any(
-            (w_clean := re.sub(r"[^a-z]", "", w.lower())) in ALL_STOP_WORDS
-            or len(w_clean) < 3
-            or w_clean.isdigit()
-            or w_clean == ""
-            for w in words
+            w in ALL_STOP_WORDS
+            or len(w) < 3
+            or w.isdigit()
+            or w == ""
+            for w in cleaned_words
         ):
+            continue
+
+        # English Dictionary & Domain-Acronym Validation:
+        # Every constituent word must be in DOMAIN_WHITELIST or a valid English dictionary word.
+        # Discards Romanized Hindi verb/noun stems not found in standard English dictionaries.
+        if any(not _is_valid_word(w) for w in cleaned_words):
             continue
         v_curr = float(curr_window_counts[col_idx])
         v_prev_avg = float(prev_avg[col_idx])
@@ -288,12 +342,14 @@ def _analyze_range(
         if tag not in tfidf_terms:
             raw_tag = tag.lstrip("#")
             tag_words = raw_tag.split("_")
+            cleaned_tag_words = [re.sub(r"[^a-z]", "", w.lower()) for w in tag_words]
             if (
                 raw_tag.isdigit()
                 or len(raw_tag) < 3
                 or re.search(r"\b\d+\b", raw_tag)
                 or raw_tag in ALL_STOP_WORDS
-                or any(w in ALL_STOP_WORDS or len(w) < 3 or w.isdigit() for w in tag_words)
+                or any(w in ALL_STOP_WORDS or len(w) < 3 or w.isdigit() or w == "" for w in cleaned_tag_words)
+                or any(not _is_valid_word(w) for w in cleaned_tag_words)
             ):
                 continue
             term_stats.append({
