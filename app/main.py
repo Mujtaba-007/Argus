@@ -12,6 +12,7 @@
 import asyncio
 import logging
 import logging.config
+import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
@@ -223,7 +224,7 @@ def _get_tracker_analytics_lock(tracker_id: str) -> asyncio.Lock:
 
 
 @app.post("/run-analytics", tags=["ops"])
-async def trigger_analytics(tracker_id: str | None = None) -> dict[str, str]:
+async def trigger_analytics(tracker_id: str | None = None) -> dict[str, Any]:
     """
     Kick off trend, network, and demographic analytics in the background and return immediately.
     If tracker_id is provided, runs for that tracker only.
@@ -231,80 +232,85 @@ async def trigger_analytics(tracker_id: str | None = None) -> dict[str, str]:
     Enforces a per-tracker asyncio.Lock (returns {"status":"already_running"} if active).
     Enforces a 5-minute throttle (returns {"status":"throttled"} if run < 5m ago).
     """
-    logger.info("POST /run-analytics triggered for tracker_id=%s.", tracker_id)
+    try:
+        logger.info("POST /run-analytics triggered for tracker_id=%s.", tracker_id)
 
-    # 1. Determine target trackers
-    targets: list[str]
-    if tracker_id:
-        targets = [tracker_id]
-    else:
-        try:
-            trackers = await asyncio.to_thread(get_active_trackers)
-            targets = [t["id"] for t in trackers]
-        except Exception as exc:
-            logger.error("/run-analytics: failed to fetch trackers — %s", exc)
-            return {"status": "error", "message": str(exc)}
-
-    if not targets:
-        return {"status": "no_trackers"}
-
-    now_mono = time.monotonic()
-
-    # 2. If a single tracker is requested, check rate-limiting and lock status immediately
-    if tracker_id:
-        last_time = _analytics_last_run.get(tracker_id, 0.0)
-        if (now_mono - last_time) < ANALYTICS_THROTTLE_SECONDS:
-            logger.info("POST /run-analytics [%s]: throttled (last run %.1fs ago).", tracker_id, now_mono - last_time)
-            return {"status": "throttled"}
-
-        lock = _get_tracker_analytics_lock(tracker_id)
-        if lock.locked():
-            logger.info("POST /run-analytics [%s]: already running.", tracker_id)
-            return {"status": "already_running"}
-
-    # 3. Background task to execute analytics with per-tracker locks
-    async def _execute_tracker_analytics(tid: str) -> None:
-        t_lock = _get_tracker_analytics_lock(tid)
-        if t_lock.locked():
-            logger.info("Background analytics [%s]: already running. Skipping.", tid)
-            return
-
-        async with t_lock:
-            # Mark last run time
-            _analytics_last_run[tid] = time.monotonic()
-            logger.info("Background analytics [%s]: started.", tid)
-
-            # Trends analysis in worker thread
+        # 1. Determine target trackers
+        targets: list[str]
+        if tracker_id:
+            targets = [tracker_id]
+        else:
             try:
-                from app.analytics.trends import analyze_trends
-                trends_res = await asyncio.to_thread(analyze_trends, tid)
-                logger.info("Background analytics [%s] trends done: %s", tid, trends_res)
+                trackers = await asyncio.to_thread(get_active_trackers)
+                targets = [t["id"] for t in trackers]
             except Exception as exc:
-                logger.error("Background analytics [%s] trends failed: %s", tid, exc)
+                logger.error("/run-analytics: failed to fetch trackers — %s", exc)
+                return {"status": "error", "detail": str(exc)}
 
-            # Network, demographics & alerts in worker thread via scheduler
-            try:
-                from app.analytics.scheduler import run_analytics
-                sched_res = await asyncio.to_thread(run_analytics, tid)
-                logger.info("Background analytics [%s] pipeline done: %s", tid, sched_res)
-            except Exception as exc:
-                logger.error("Background analytics [%s] pipeline failed: %s", tid, exc)
+        if not targets:
+            return {"status": "no_trackers"}
 
-    async def _run_all_targets() -> None:
-        for tid in targets:
-            # Check throttle per tracker in multi-target mode
-            last_t = _analytics_last_run.get(tid, 0.0)
-            if (time.monotonic() - last_t) < ANALYTICS_THROTTLE_SECONDS:
-                logger.debug("Background analytics [%s]: throttled (<5m). Skipping.", tid)
-                continue
-            await _execute_tracker_analytics(tid)
+        now_mono = time.monotonic()
 
-    # If single tracker, mark timestamp now so immediate repeat requests get throttled
-    if tracker_id:
-        _analytics_last_run[tracker_id] = now_mono
+        # 2. If a single tracker is requested, check rate-limiting and lock status immediately
+        if tracker_id:
+            last_time = _analytics_last_run.get(tracker_id, 0.0)
+            if (now_mono - last_time) < ANALYTICS_THROTTLE_SECONDS:
+                logger.info("POST /run-analytics [%s]: throttled (last run %.1fs ago).", tracker_id, now_mono - last_time)
+                return {"status": "throttled"}
 
-    asyncio.create_task(_run_all_targets())
-    return {"status": "started"}
+            lock = _get_tracker_analytics_lock(tracker_id)
+            if lock.locked():
+                logger.info("POST /run-analytics [%s]: already running.", tracker_id)
+                return {"status": "already_running"}
+
+        # 3. Background task to execute analytics with per-tracker locks
+        async def _execute_tracker_analytics(tid: str) -> None:
+            t_lock = _get_tracker_analytics_lock(tid)
+            if t_lock.locked():
+                logger.info("Background analytics [%s]: already running. Skipping.", tid)
+                return
+
+            async with t_lock:
+                # Mark last run time
+                _analytics_last_run[tid] = time.monotonic()
+                logger.info("Background analytics [%s]: started.", tid)
+
+                # Trends analysis in worker thread
+                try:
+                    from app.analytics.trends import analyze_trends
+                    trends_res = await asyncio.to_thread(analyze_trends, tid)
+                    logger.info("Background analytics [%s] trends done: %s", tid, trends_res)
+                except Exception as exc:
+                    logger.error("Background analytics [%s] trends failed: %s", tid, exc)
+
+                # Network, demographics & alerts in worker thread via scheduler
+                try:
+                    from app.analytics.scheduler import run_analytics
+                    sched_res = await asyncio.to_thread(run_analytics, tid)
+                    logger.info("Background analytics [%s] pipeline done: %s", tid, sched_res)
+                except Exception as exc:
+                    logger.error("Background analytics [%s] pipeline failed: %s", tid, exc)
+
+        async def _run_all_targets() -> None:
+            for tid in targets:
+                # Check throttle per tracker in multi-target mode
+                last_t = _analytics_last_run.get(tid, 0.0)
+                if (time.monotonic() - last_t) < ANALYTICS_THROTTLE_SECONDS:
+                    logger.debug("Background analytics [%s]: throttled (<5m). Skipping.", tid)
+                    continue
+                await _execute_tracker_analytics(tid)
+
+        # If single tracker, mark timestamp now so immediate repeat requests get throttled
+        if tracker_id:
+            _analytics_last_run[tracker_id] = now_mono
+
+        asyncio.create_task(_run_all_targets())
+        return {"status": "started"}
+
+    except Exception as e:
+        logger.exception("Error in /run-analytics: %s", e)
+        return {"status": "error", "detail": str(e)}
 
 
 @app.post("/run-alerts", tags=["ops"])

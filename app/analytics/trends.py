@@ -27,18 +27,36 @@ from app.db.analytics_repository import (
 
 logger = logging.getLogger(__name__)
 
+def _normalize_word(word: str) -> str:
+    """Trim trailing 's' for simple English plurals (e.g. funds -> fund), avoiding 'ss'."""
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
 CUSTOM_STOP_WORDS = {
     # Web / platform noise
     "amp", "rt", "http", "https", "com", "co", "t", "telegram", "channel", "group", "zone",
+    "live", "user", "id", "user_id",
     # Hindi / Hinglish stopwords & requested conversational noise
     "ka", "ki", "ke", "ko", "hai", "h", "hain", "kab", "kya", "kaise", "kese",
     "nahi", "nhi", "ho", "hoga", "gya", "to", "toh", "bhi", "me", "mein", "se",
     "ye", "yeh", "wo", "woh", "aur", "ya", "par", "pe", "na", "ek",
     "bhai", "bro", "sir", "please", "pls", "ok", "okay", "hi", "ha", "haan",
     "ji", "kr", "kar", "jo", "ab", "mera", "meri", "mere", "dekho", "abe", "saale",
-    "tk", "lia", "respond", "tell", "got", "tha", "thi",
+    "tk", "tak", "lia", "liya", "liye", "respond", "tell", "got", "tha", "thi",
+    "rha", "raha", "rhi", "rahi", "dikha", "dur", "itna", "city", "intimation", "diya",
+    "koi", "aaya", "aaye", "aayi", "aya", "aye", "ayi", "kuch", "sab", "apna", "apni", "apne",
+    "fir", "phir", "abhi", "aisa", "aise", "aisi",
 }
-STOP_WORDS = list(ENGLISH_STOP_WORDS.union(CUSTOM_STOP_WORDS))
+
+# Combined set of all stop words (English + Custom), including normalized forms
+ALL_STOP_WORDS = {
+    w
+    for sw in ENGLISH_STOP_WORDS.union(CUSTOM_STOP_WORDS)
+    for w in (sw, _normalize_word(sw))
+}
+STOP_WORDS = list(ALL_STOP_WORDS)
 
 # Range configurations: label, lookback_hours, window_hours
 RANGE_CONFIGS = [
@@ -51,9 +69,16 @@ _MAX_POSTS_PER_RANGE = 3_000
 
 
 def _clean_text(text: str) -> str:
-    """Lowercase and strip URLs and punctuation for keyword extraction."""
+    """
+    Lowercase text, strip URLs, numbers, non-alphanumeric characters,
+    and normalize simple plurals by trimming trailing 's' (e.g. funds -> fund).
+    """
     no_url = re.sub(r"https?://\S+|www\.\S+", " ", (text or "").lower())
-    return re.sub(r"[^\w\s]", " ", no_url).strip()
+    # Strip numbers and non-alphanumeric characters (keep only a-z and whitespace)
+    alpha_only = re.sub(r"[^a-z\s]", " ", no_url)
+    # Normalize trailing 's' on words > 3 chars
+    words = [_normalize_word(w) for w in alpha_only.split()]
+    return " ".join(words)
 
 
 def _analyze_range(
@@ -148,7 +173,11 @@ def _analyze_range(
     prev_avg = prev_sum / len(prev_window_arrays) if prev_window_arrays else np.zeros(len(feature_names))
 
     # ── Also collect hashtags ─────────────────────────────────────────────────
-    all_tags = [h.lower() for _, b in valid_posts for h in re.findall(r"#\w+", b)]
+    all_tags = [
+        "#" + _normalize_word(h.lstrip("#").lower())
+        for _, b in valid_posts
+        for h in re.findall(r"#\w+", b)
+    ]
     tag_counts = Counter(all_tags)
     hashtag_candidates = {t: c for t, c in tag_counts.items() if c >= 3}
 
@@ -163,8 +192,9 @@ def _analyze_range(
         total_range_vol = int(range_counts[col_idx])
         if total_range_vol < 3:
             continue
-        # Drop terms that are only digits, shorter than 3 chars, or contain a digit‑only token
-        if term.isdigit() or len(term) < 3 or re.search(r"\b\d+\b", term):
+        words = term.split()
+        # Drop if any constituent word is in ALL_STOP_WORDS, shorter than 3 chars, or digit-only
+        if any(w in ALL_STOP_WORDS or len(w) < 3 or w.isdigit() for w in words):
             continue
         v_curr = float(curr_window_counts[col_idx])
         v_prev_avg = float(prev_avg[col_idx])
@@ -176,6 +206,9 @@ def _analyze_range(
                 velocity = 0.0
             else:
                 velocity = (v_curr - v_prev_avg) / v_prev_avg
+        # Cap velocity at +999% (9.99), especially for 7D/30D ranges
+        if velocity > 9.99:
+            velocity = 9.99
         prev_vols = [float(a[col_idx]) for a in prev_window_arrays]
         is_rising = bool(
             (sum(prev_vols) >= 2 or v_prev_avg >= 1.5)
@@ -198,8 +231,15 @@ def _analyze_range(
     tfidf_terms = {r["term"] for r in term_stats}
     for tag, count in hashtag_candidates.items():
         if tag not in tfidf_terms:
-            # Apply same filtering to hashtags
-            if tag.isdigit() or len(tag) < 3 or re.search(r"\b\d+\b", tag):
+            raw_tag = tag.lstrip("#")
+            tag_words = raw_tag.split("_")
+            if (
+                raw_tag.isdigit()
+                or len(raw_tag) < 3
+                or re.search(r"\b\d+\b", raw_tag)
+                or raw_tag in ALL_STOP_WORDS
+                or any(w in ALL_STOP_WORDS or len(w) < 3 or w.isdigit() for w in tag_words)
+            ):
                 continue
             term_stats.append({
                 "tracker_id": tracker_id,
@@ -212,10 +252,52 @@ def _analyze_range(
                 "_score": float(count),
             })
 
-    # Sort and take top 20, then enforce cooling limit (max 50% cooling rows)
+    # Sort and take top terms with sub-gram suppression
     term_stats.sort(key=lambda x: (x["_score"], x["volume"]), reverse=True)
-    top_terms = term_stats[:20]
-    # Enforce cooling rows limit
+
+    # Sub-gram suppression: If a bigram (e.g., 'long term') is selected in top trends,
+    # suppress standalone unigrams ('long', 'term') from occupying separate top-20 slots
+    # unless their independent frequency is significantly higher (>= 1.5x).
+    selected_terms: list[dict[str, Any]] = []
+
+    for cand in term_stats:
+        cand_term = cand["term"]
+        cand_words = cand_term.split()
+        cand_vol = cand["volume"]
+
+        # If candidate is a unigram, check if it's a sub-word of an already selected bigram
+        if len(cand_words) == 1:
+            unigram = cand_words[0]
+            suppressed = False
+            for sel in selected_terms:
+                sel_words = sel["term"].split()
+                if len(sel_words) > 1 and unigram in sel_words:
+                    if cand_vol < 1.5 * sel["volume"]:
+                        suppressed = True
+                        break
+            if suppressed:
+                continue
+
+        # If candidate is a bigram, purge any earlier selected unigrams that are its sub-words
+        # unless their volume is >= 1.5x of this bigram
+        elif len(cand_words) > 1:
+            selected_terms = [
+                sel
+                for sel in selected_terms
+                if not (
+                    len(sel["term"].split()) == 1
+                    and sel["term"] in cand_words
+                    and sel["volume"] < 1.5 * cand_vol
+                )
+            ]
+
+        selected_terms.append(cand)
+        if len(selected_terms) >= 20:
+            break
+
+    top_terms = selected_terms[:20]
+
+    # Enforce cooling rows limit (max 50% cooling rows)
     cooling_rows = [t for t in top_terms if t["velocity"] < 0]
     if len(cooling_rows) > len(top_terms) / 2:
         excess = len(cooling_rows) - int(len(top_terms) / 2)
@@ -225,7 +307,6 @@ def _analyze_range(
     for row in top_terms:
         row.pop("_score", None)
 
-    return top_terms
     return top_terms
 
 
