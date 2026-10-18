@@ -9,11 +9,13 @@
 #   - Term volume per window is computed with a single vectorized matrix pass
 #     instead of per-term regex loops.
 
+import gzip
 import logging
 import re
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -107,6 +109,8 @@ DOMAIN_WHITELIST: set[str] = {
 }
 
 # Fast English dictionary loader (bundled gzipped word list with fallback)
+DATA_DIR = Path(__file__).resolve().parent / "data"
+WORDS_FILE = DATA_DIR / "words.txt.gz"
 _ENGLISH_WORDS_CACHE: set[str] | None = None
 
 
@@ -116,17 +120,19 @@ def _get_english_words() -> set[str]:
     if _ENGLISH_WORDS_CACHE is not None:
         return _ENGLISH_WORDS_CACHE
 
-    import gzip
-    from pathlib import Path
-
-    dict_path = Path(__file__).resolve().parent / "data" / "words.txt.gz"
-    if dict_path.is_file():
+    if WORDS_FILE.exists():
         try:
-            with gzip.open(dict_path, "rt", encoding="utf-8") as f:
+            with gzip.open(WORDS_FILE, "rt", encoding="utf-8") as f:
                 _ENGLISH_WORDS_CACHE = {line.strip().lower() for line in f if line.strip()}
+            logger.info("Loaded %d English words from %s", len(_ENGLISH_WORDS_CACHE), WORDS_FILE)
             return _ENGLISH_WORDS_CACHE
         except Exception as exc:
-            logger.warning("Failed to load bundled words dictionary: %s", exc)
+            logger.warning("Failed to load bundled words dictionary from %s: %s", WORDS_FILE, exc)
+    else:
+        logger.warning(
+            "Dictionary file missing at %s; falling back to basic English stop words list.",
+            WORDS_FILE,
+        )
 
     # Fallback to English stop words and basic set if file is unavailable
     _ENGLISH_WORDS_CACHE = set(ENGLISH_STOP_WORDS)
