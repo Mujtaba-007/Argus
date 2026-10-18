@@ -48,6 +48,7 @@ CUSTOM_STOP_WORDS = {
     "rha", "raha", "rhi", "rahi", "dikha", "dur", "itna", "city", "intimation", "diya",
     "koi", "aaya", "aaye", "aayi", "aya", "aye", "ayi", "kuch", "sab", "apna", "apni", "apne",
     "fir", "phir", "abhi", "aisa", "aise", "aisi",
+    "apka", "mujhe", "kiya",
 }
 
 # Combined set of all stop words (English + Custom), including normalized forms
