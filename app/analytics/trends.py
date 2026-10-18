@@ -165,7 +165,7 @@ RANGE_CONFIGS = [
     ("30D", 720, 72),  # 30 days lookback, 10 windows of 72 hours
 ]
 
-_MAX_POSTS_PER_RANGE = 3_000
+_MAX_POSTS_PER_RANGE = 25_000
 
 
 def _clean_text(text: str) -> str:
@@ -190,7 +190,7 @@ def _analyze_range(
 ) -> list[dict[str, Any]]:
     """
     Compute trend metrics for a specific time range using vectorized counts.
-    Caps to the newest 3 000 posts. Returns trend dicts with volume >= 3.
+    Caps to the newest 25 000 posts. Returns trend dicts with volume >= 3.
     """
     if not valid_posts:
         return []
@@ -442,7 +442,7 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
 
     try:
         t_fetch = time.monotonic()
-        raw_posts = get_posts_for_trends(tracker_id, cutoff)
+        raw_posts = get_posts_for_trends(tracker_id, cutoff, limit=40_000)
         fetch_secs = time.monotonic() - t_fetch
     except Exception as exc:
         msg = f"Failed to fetch posts from database: {exc}"
@@ -481,6 +481,13 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
         range_cutoff = now_utc - timedelta(hours=lookback_h)
         # Filter in memory (no additional DB call)
         range_posts = [p for p in valid_posts if p[0] >= range_cutoff]
+
+        earliest_dt = range_posts[-1][0] if range_posts else None
+        latest_dt = range_posts[0][0] if range_posts else None
+        logger.info(
+            "Trends [%s]: [%s] %d posts in window (from %s to %s).",
+            tracker_id, range_label, len(range_posts), earliest_dt, latest_dt,
+        )
 
         range_rows = _analyze_range(
             tracker_id=tracker_id,
