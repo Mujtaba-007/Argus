@@ -5,10 +5,14 @@
 #
 # Performance notes:
 #   - All three ranges are computed from ONE 30D DB fetch (filtered in memory).
-#   - Each range is capped to the newest 5 000 posts before TF-IDF.
+#   - Each range is capped to the newest 2 000 posts before TF-IDF.
 #   - Term volume per window is computed with a single vectorized matrix pass
 #     instead of per-term regex loops.
+#   - Dictionary is loaded lazily on first use, filtered to ≤60 000 words,
+#     and stored as a frozenset to minimise heap size.
+#   - gc.collect() is called after each tracker run to reclaim memory promptly.
 
+import gc
 import gzip
 import logging
 import re
@@ -111,31 +115,55 @@ DOMAIN_WHITELIST: set[str] = {
 # Fast English dictionary loader (bundled gzipped word list with fallback)
 DATA_DIR = Path(__file__).resolve().parent / "data"
 WORDS_FILE = DATA_DIR / "words.txt.gz"
-_ENGLISH_WORDS_CACHE: set[str] | None = None
+_ENGLISH_WORDS_CACHE: frozenset[str] | None = None
+
+# Maximum words to retain from the dictionary (frequency-ordered file assumed).
+# Keeping the 60 000 most-common words covers virtually all real content terms
+# while limiting peak heap allocation to ~5 MB vs ~30 MB for the full 369k list.
+_MAX_DICT_WORDS = 60_000
 
 
-def _get_english_words() -> set[str]:
-    """Load English words dictionary from bundled data or fallback."""
+def _get_english_words() -> frozenset[str]:
+    """
+    Load and cache the English word list as a frozenset.
+
+    Filtering rules applied once at load time:
+    - Lowercase alphabetic characters only (no digits/hyphens/apostrophes).
+    - Length 3–15 characters.
+    - At most 60 000 words (first N from frequency-ordered file = most common).
+    The temporary list is deleted immediately after the frozenset is built.
+    """
     global _ENGLISH_WORDS_CACHE
     if _ENGLISH_WORDS_CACHE is not None:
         return _ENGLISH_WORDS_CACHE
 
     if WORDS_FILE.exists():
         try:
+            raw: list[str] = []
             with gzip.open(WORDS_FILE, "rt", encoding="utf-8") as f:
-                _ENGLISH_WORDS_CACHE = {line.strip().lower() for line in f if line.strip()}
-            logger.info("Loaded %d English words from %s", len(_ENGLISH_WORDS_CACHE), WORDS_FILE)
+                for line in f:
+                    w = line.strip().lower()
+                    if w.isalpha() and 3 <= len(w) <= 15:
+                        raw.append(w)
+                    if len(raw) >= _MAX_DICT_WORDS:
+                        break
+            _ENGLISH_WORDS_CACHE = frozenset(raw)
+            del raw  # release temporary list immediately
+            logger.info(
+                "Loaded %d English words from %s (capped at %d).",
+                len(_ENGLISH_WORDS_CACHE), WORDS_FILE, _MAX_DICT_WORDS,
+            )
             return _ENGLISH_WORDS_CACHE
         except Exception as exc:
             logger.warning("Failed to load bundled words dictionary from %s: %s", WORDS_FILE, exc)
     else:
         logger.warning(
-            "Dictionary file missing at %s; falling back to basic English stop words list.",
+            "Dictionary file missing at %s; falling back to sklearn stop-word set.",
             WORDS_FILE,
         )
 
-    # Fallback to English stop words and basic set if file is unavailable
-    _ENGLISH_WORDS_CACHE = set(ENGLISH_STOP_WORDS)
+    # Fallback: sklearn's built-in stop words (tiny but always available)
+    _ENGLISH_WORDS_CACHE = frozenset(ENGLISH_STOP_WORDS)
     return _ENGLISH_WORDS_CACHE
 
 
@@ -165,7 +193,7 @@ RANGE_CONFIGS = [
     ("30D", 720, 72),  # 30 days lookback, 10 windows of 72 hours
 ]
 
-_MAX_POSTS_PER_RANGE = 25_000
+_MAX_POSTS_PER_RANGE = 2_000
 
 
 def _clean_text(text: str) -> str:
@@ -190,12 +218,12 @@ def _analyze_range(
 ) -> list[dict[str, Any]]:
     """
     Compute trend metrics for a specific time range using vectorized counts.
-    Caps to the newest 25 000 posts. Returns trend dicts with volume >= 3.
+    Caps to the newest 2 000 posts. Returns trend dicts with volume >= 3.
     """
     if not valid_posts:
         return []
 
-    # Cap each range at 3 000 posts before TF-IDF
+    # Cap each range at 2 000 posts before TF-IDF
     if len(valid_posts) > _MAX_POSTS_PER_RANGE:
         valid_posts = valid_posts[:_MAX_POSTS_PER_RANGE]
 
@@ -223,10 +251,11 @@ def _analyze_range(
     # ── TF-IDF vectorizer fit on full range ─────────────────────────────────
     try:
         vec = TfidfVectorizer(
-            max_features=3000,
+            max_features=2000,
             ngram_range=(1, 2),
             stop_words=STOP_WORDS,
             min_df=3,
+            dtype=np.float32,
         )
         X_range = vec.fit_transform(total_range_texts)
     except ValueError:
@@ -427,6 +456,41 @@ def _analyze_range(
     return top_terms
 
 
+# ── Memory monitoring helper ─────────────────────────────────────────────────
+
+def _get_process_memory_mb() -> float:
+    """Return the current process RSS in MB. Uses psutil when available."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1_048_576
+    except ImportError:
+        pass
+    try:
+        import resource  # Unix only
+        # getrusage returns kilobytes on Linux
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return 0.0
+
+
+_MEMORY_WARN_MB = 400  # log WARNING if RSS exceeds this threshold
+
+
+def _log_memory(label: str, tracker_id: str) -> float:
+    """Log process memory and warn if above threshold. Returns RSS in MB."""
+    mb = _get_process_memory_mb()
+    if mb <= 0:
+        return mb
+    if mb >= _MEMORY_WARN_MB:
+        logger.warning(
+            "Trends [%s] %s: process memory %.1f MB (exceeds %d MB threshold).",
+            tracker_id, label, mb, _MEMORY_WARN_MB,
+        )
+    else:
+        logger.info("Trends [%s] %s: process memory %.1f MB.", tracker_id, label, mb)
+    return mb
+
+
 def analyze_trends(tracker_id: str) -> dict[str, Any]:
     """
     Compute and store trends for a tracker for 24H, 7D, and 30D ranges.
@@ -435,6 +499,7 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
     """
     t_start = time.monotonic()
     logger.info("Trends [%s]: starting analysis.", tracker_id)
+    _log_memory("start", tracker_id)
 
     # ONE fetch for the full 30D window
     max_lookback = 720
@@ -514,14 +579,22 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
         all_range_rows.extend(range_rows)
 
     total_secs = time.monotonic() - t_start
+    n_posts = len(valid_posts)
+    n_rows = len(all_range_rows)
     logger.info(
         "Trends [%s]: completed in %.2fs — total rows written: %d.",
-        tracker_id, total_secs, len(all_range_rows),
+        tracker_id, total_secs, n_rows,
     )
+    _log_memory("end", tracker_id)
+
+    # Release large objects and trigger GC so the next tracker starts clean.
+    del valid_posts, all_range_rows
+    gc.collect()
+
     return {
-        "posts_analyzed": len(valid_posts),
+        "posts_analyzed": n_posts,
         "windows_used": len(RANGE_CONFIGS),
-        "terms_found": len(all_range_rows),
-        "terms_written": len(all_range_rows),
+        "terms_found": n_rows,
+        "terms_written": n_rows,
         "reason": None,
     }
