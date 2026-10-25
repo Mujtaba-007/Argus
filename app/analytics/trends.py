@@ -28,6 +28,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from app.db.analytics_repository import (
     delete_trends_for_tracker_and_range,
     get_posts_for_trends,
+    get_posts_for_trends_bucketed,
     insert_trends_batch,
 )
 
@@ -494,74 +495,100 @@ def _log_memory(label: str, tracker_id: str) -> float:
 def analyze_trends(tracker_id: str) -> dict[str, Any]:
     """
     Compute and store trends for a tracker for 24H, 7D, and 30D ranges.
-    Fetches 30D data ONCE and filters in memory for each range.
-    Returns metrics dict.
+
+    Fetch strategy (memory-bounded — never more than ~2 000 posts in RAM
+    at once per range):
+    - 24H : one bounded DESC query for the newest 2 000 posts in the window.
+    - 7D  : 24-bucket evenly-spaced sample, ≤80 posts per bucket (~1 920 total).
+    - 30D : 24-bucket evenly-spaced sample, ≤80 posts per bucket (~1 920 total).
+
+    After each range is processed its post list is deleted and gc.collect()
+    is called before the next range begins.
     """
     t_start = time.monotonic()
     logger.info("Trends [%s]: starting analysis.", tracker_id)
     _log_memory("start", tracker_id)
 
-    # ONE fetch for the full 30D window
-    max_lookback = 720
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_lookback)).isoformat()
-
-    try:
-        t_fetch = time.monotonic()
-        raw_posts = get_posts_for_trends(tracker_id, cutoff, limit=40_000)
-        fetch_secs = time.monotonic() - t_fetch
-    except Exception as exc:
-        msg = f"Failed to fetch posts from database: {exc}"
-        logger.error("Trends [%s]: %s", tracker_id, msg)
-        return {"posts_analyzed": 0, "windows_used": 0, "terms_found": 0, "terms_written": 0, "reason": msg}
-
-    valid_posts: list[tuple[datetime, str]] = []
-    for p in raw_posts:
-        body = p.get("body", "")
-        if not body:
-            continue
-        try:
-            dt = datetime.fromisoformat(p["posted_at"]).replace(tzinfo=timezone.utc)
-            valid_posts.append((dt, body))
-        except Exception:
-            continue
-
-    # Sort descending once — _analyze_range can then cheaply slice the newest N
-    valid_posts.sort(key=lambda x: x[0], reverse=True)
-
-    logger.info(
-        "Trends [%s]: fetched %d raw rows, %d valid posts in %.2fs.",
-        tracker_id, len(raw_posts), len(valid_posts), fetch_secs,
-    )
-
-    if not valid_posts:
-        reason = f"No posts with valid timestamps found in lookback period ({max_lookback}h)."
-        logger.info("Trends [%s]: 0 terms written. %s", tracker_id, reason)
-        return {"posts_analyzed": 0, "windows_used": 0, "terms_found": 0, "terms_written": 0, "reason": reason}
-
     now_utc = datetime.now(timezone.utc)
-    all_range_rows: list[dict[str, Any]] = []
 
-    for range_label, lookback_h, win_h in RANGE_CONFIGS:
+    # ── Per-range fetch config ────────────────────────────────────────────────
+    # (range_label, lookback_hours, win_hours, use_bucketed_fetch)
+    FETCH_CONFIGS = [
+        ("24H",  24,   1,  False),  # newest 2 000, single bounded query
+        ("7D",   168,  24, True),   # 24-bucket evenly-spaced sample
+        ("30D",  720,  72, True),   # 24-bucket evenly-spaced sample
+    ]
+
+    total_posts_analyzed = 0
+    total_rows_written = 0
+
+    for range_label, lookback_h, win_h, use_buckets in FETCH_CONFIGS:
         t_range = time.monotonic()
-        range_cutoff = now_utc - timedelta(hours=lookback_h)
-        # Filter in memory (no additional DB call)
-        range_posts = [p for p in valid_posts if p[0] >= range_cutoff]
+        window_start = now_utc - timedelta(hours=lookback_h)
+        window_start_iso = window_start.isoformat()
 
-        earliest_dt = range_posts[-1][0] if range_posts else None
-        latest_dt = range_posts[0][0] if range_posts else None
+        # ── Fetch ─────────────────────────────────────────────────────────────
+        try:
+            if use_buckets:
+                raw_posts = get_posts_for_trends_bucketed(
+                    tracker_id=tracker_id,
+                    window_start=window_start,
+                    window_end=now_utc,
+                    n_buckets=24,
+                    posts_per_bucket=80,
+                )
+            else:
+                raw_posts = get_posts_for_trends(
+                    tracker_id, window_start_iso, limit=2000
+                )
+        except Exception as exc:
+            logger.error("Trends [%s]: [%s] fetch failed — %s", tracker_id, range_label, exc)
+            continue
+
+        # ── Parse & validate timestamps ───────────────────────────────────────
+        valid_posts: list[tuple[datetime, str]] = []
+        for p in raw_posts:
+            body = p.get("body", "")
+            if not body:
+                continue
+            try:
+                dt = datetime.fromisoformat(p["posted_at"]).replace(tzinfo=timezone.utc)
+                valid_posts.append((dt, body))
+            except Exception:
+                continue
+
+        # Sort descending (newest first) — _analyze_range expects this
+        valid_posts.sort(key=lambda x: x[0], reverse=True)
+
+        earliest_dt = valid_posts[-1][0] if valid_posts else None
+        latest_dt   = valid_posts[0][0]  if valid_posts else None
         logger.info(
-            "Trends [%s]: [%s] %d posts in window (from %s to %s).",
-            tracker_id, range_label, len(range_posts), earliest_dt, latest_dt,
+            "Trends [%s]: [%s] %d posts fetched (from %s to %s).",
+            tracker_id, range_label, len(valid_posts), earliest_dt, latest_dt,
         )
 
+        if not valid_posts:
+            logger.info("Trends [%s]: [%s] no valid posts — skipping.", tracker_id, range_label)
+            continue
+
+        # ── Analyse ───────────────────────────────────────────────────────────
         range_rows = _analyze_range(
             tracker_id=tracker_id,
             range_label=range_label,
-            valid_posts=range_posts,
+            valid_posts=valid_posts,
             lookback_hours=lookback_h,
             win_hours=win_h,
         )
 
+        # ── Log top-3 terms ───────────────────────────────────────────────────
+        top3 = [(r["term"], r["volume"]) for r in range_rows[:3]]
+        logger.info(
+            "Trends [%s]: [%s] top-3 terms: %s",
+            tracker_id, range_label,
+            ", ".join(f'"{t}" ({v})' for t, v in top3) if top3 else "(none)",
+        )
+
+        # ── Persist ───────────────────────────────────────────────────────────
         try:
             delete_trends_for_tracker_and_range(tracker_id, range_label)
             if range_rows:
@@ -572,29 +599,33 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
             )
 
         range_secs = time.monotonic() - t_range
+        n_range_posts = len(valid_posts)
+        n_range_rows  = len(range_rows)
         logger.info(
-            "Trends [%s]: range %s done in %.2fs — %d posts → %d terms written.",
-            tracker_id, range_label, range_secs, len(range_posts), len(range_rows),
+            "Trends [%s]: [%s] done in %.2fs — %d posts → %d terms written.",
+            tracker_id, range_label, range_secs, n_range_posts, n_range_rows,
         )
-        all_range_rows.extend(range_rows)
 
+        total_posts_analyzed += n_range_posts
+        total_rows_written   += n_range_rows
+
+        # ── Free memory before next range ─────────────────────────────────────
+        del valid_posts, raw_posts, range_rows
+        gc.collect()
+
+    # ── Final summary ─────────────────────────────────────────────────────────
     total_secs = time.monotonic() - t_start
-    n_posts = len(valid_posts)
-    n_rows = len(all_range_rows)
     logger.info(
         "Trends [%s]: completed in %.2fs — total rows written: %d.",
-        tracker_id, total_secs, n_rows,
+        tracker_id, total_secs, total_rows_written,
     )
     _log_memory("end", tracker_id)
-
-    # Release large objects and trigger GC so the next tracker starts clean.
-    del valid_posts, all_range_rows
     gc.collect()
 
     return {
-        "posts_analyzed": n_posts,
-        "windows_used": len(RANGE_CONFIGS),
-        "terms_found": n_rows,
-        "terms_written": n_rows,
+        "posts_analyzed": total_posts_analyzed,
+        "windows_used": len(FETCH_CONFIGS),
+        "terms_found": total_rows_written,
+        "terms_written": total_rows_written,
         "reason": None,
     }

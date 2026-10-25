@@ -3,8 +3,11 @@
 # Keeps repository.py modular and under 150 lines.
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
+
 from app.db.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
@@ -18,8 +21,15 @@ _db_retry = retry(
 
 
 @_db_retry
-def get_posts_for_trends(tracker_id: str, since_iso: str, limit: int = 5000) -> list[dict[str, Any]]:
-    """Fetch newest posts (up to limit) from the lookback period for trend analysis ordered desc."""
+def get_posts_for_trends(tracker_id: str, since_iso: str, limit: int = 2000) -> list[dict[str, Any]]:
+    """
+    Fetch the newest *limit* posts from since_iso to now in a single bounded
+    query (ordered DESC).  Used for the 24H range where recency matters and
+    ~2 000 posts is enough for TF-IDF.
+
+    Paginates in pages of 1 000 only when limit > 1 000, so the common
+    2 000-post case makes exactly 2 round-trips.
+    """
     page_size = 1000
     all_posts: list[dict[str, Any]] = []
     start = 0
@@ -39,6 +49,62 @@ def get_posts_for_trends(tracker_id: str, since_iso: str, limit: int = 5000) -> 
         if len(batch) < fetch_count:
             break
         start += fetch_count
+    return all_posts
+
+
+@_db_retry
+def _fetch_bucket(
+    tracker_id: str,
+    bucket_start_iso: str,
+    bucket_end_iso: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Single bucket query: up to *limit* posts in [bucket_start, bucket_end)."""
+    res = (
+        supabase.table("posts")
+        .select("body, posted_at")
+        .eq("tracker_id", tracker_id)
+        .gte("posted_at", bucket_start_iso)
+        .lt("posted_at", bucket_end_iso)
+        .order("posted_at", desc=False)   # oldest-first keeps chronological spread
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+
+def get_posts_for_trends_bucketed(
+    tracker_id: str,
+    window_start: datetime,
+    window_end: datetime,
+    n_buckets: int = 24,
+    posts_per_bucket: int = 80,
+) -> list[dict[str, Any]]:
+    """
+    Evenly-sampled fetch across [window_start, window_end).
+
+    Divides the window into *n_buckets* equal slices and fetches up to
+    *posts_per_bucket* posts from each bucket (oldest-first).  This gives a
+    time-stratified sample of at most n_buckets × posts_per_bucket ≈ 1 920
+    posts that spans the *entire* window, so 7D and 30D trends reflect
+    different epochs rather than only the most-recent hours.
+
+    Each bucket is a single Supabase query with LIMIT — no full-table scan.
+    """
+    bucket_size = (window_end - window_start) / n_buckets
+    all_posts: list[dict[str, Any]] = []
+
+    for i in range(n_buckets):
+        b_start = window_start + bucket_size * i
+        b_end   = window_start + bucket_size * (i + 1)
+        batch = _fetch_bucket(
+            tracker_id=tracker_id,
+            bucket_start_iso=b_start.isoformat(),
+            bucket_end_iso=b_end.isoformat(),
+            limit=posts_per_bucket,
+        )
+        all_posts.extend(batch)
+
     return all_posts
 
 
