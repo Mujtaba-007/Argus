@@ -4,16 +4,18 @@
 # Extracts TF-IDF keywords, hashtags, and capitalized named entities.
 #
 # Performance notes:
-#   - All three ranges are computed from ONE 30D DB fetch (filtered in memory).
+#   - All three ranges are processed from separate, range-specific DB fetches.
 #   - Each range is capped to the newest 2 000 posts before TF-IDF.
 #   - Term volume per window is computed with a single vectorized matrix pass
 #     instead of per-term regex loops.
-#   - Dictionary is loaded lazily on first use, filtered to ≤60 000 words,
-#     and stored as a frozenset to minimise heap size.
+#   - Dictionary is loaded lazily on first use (ALL qualifying words, no cap),
+#     filtered to lowercase alphabetic words of 3–15 characters, stored as a
+#     frozenset.  The raw list is deleted immediately after the frozenset is built.
 #   - gc.collect() is called after each tracker run to reclaim memory promptly.
 
 import gc
 import gzip
+import hashlib
 import logging
 import re
 import time
@@ -118,10 +120,8 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 WORDS_FILE = DATA_DIR / "words.txt.gz"
 _ENGLISH_WORDS_CACHE: frozenset[str] | None = None
 
-# Maximum words to retain from the dictionary (frequency-ordered file assumed).
-# Keeping the 60 000 most-common words covers virtually all real content terms
-# while limiting peak heap allocation to ~5 MB vs ~30 MB for the full 369k list.
-_MAX_DICT_WORDS = 60_000
+# Words to verify are present in the dictionary after loading (Task 2 self-check).
+_DICT_SELFCHECK_WORDS = ("exam", "result", "railway", "station", "answer")
 
 
 def _get_english_words() -> frozenset[str]:
@@ -131,8 +131,9 @@ def _get_english_words() -> frozenset[str]:
     Filtering rules applied once at load time:
     - Lowercase alphabetic characters only (no digits/hyphens/apostrophes).
     - Length 3–15 characters.
-    - At most 60 000 words (first N from frequency-ordered file = most common).
-    The temporary list is deleted immediately after the frozenset is built.
+    - ALL qualifying words are loaded; there is no cap.
+    The temporary list is deleted immediately after the frozenset is built
+    to free the intermediate list memory.
     """
     global _ENGLISH_WORDS_CACHE
     if _ENGLISH_WORDS_CACHE is not None:
@@ -146,14 +147,25 @@ def _get_english_words() -> frozenset[str]:
                     w = line.strip().lower()
                     if w.isalpha() and 3 <= len(w) <= 15:
                         raw.append(w)
-                    if len(raw) >= _MAX_DICT_WORDS:
-                        break
             _ENGLISH_WORDS_CACHE = frozenset(raw)
             del raw  # release temporary list immediately
+            mem_mb = _get_process_memory_mb()
             logger.info(
-                "Loaded %d English words from %s (capped at %d).",
-                len(_ENGLISH_WORDS_CACHE), WORDS_FILE, _MAX_DICT_WORDS,
+                "Dictionary loaded: %d English words from %s. Process RSS: %.1f MB.",
+                len(_ENGLISH_WORDS_CACHE), WORDS_FILE, mem_mb,
             )
+            # ── Startup self-check (Task 2) ──────────────────────────────────
+            missing = [w for w in _DICT_SELFCHECK_WORDS if w not in _ENGLISH_WORDS_CACHE]
+            if missing:
+                logger.warning(
+                    "Dictionary self-check FAILED — these expected words are MISSING: %s",
+                    missing,
+                )
+            else:
+                logger.info(
+                    "Dictionary self-check OK — all probe words present: %s",
+                    list(_DICT_SELFCHECK_WORDS),
+                )
             return _ENGLISH_WORDS_CACHE
         except Exception as exc:
             logger.warning("Failed to load bundled words dictionary from %s: %s", WORDS_FILE, exc)
@@ -296,6 +308,16 @@ def _analyze_range(
         range_counts = np.asarray(C_range.sum(axis=0)).flatten()
     except Exception:
         range_counts = term_doc_counts  # fallback to doc-frequency
+
+    # ── Task 4: volume accounting note ──────────────────────────────────────
+    # Volume is a SAMPLE COUNT: raw term occurrences summed over at most
+    # _MAX_POSTS_PER_RANGE (2 000) sampled posts, not over all posts in the DB.
+    # For 7D/30D these posts are time-stratified via bucketed sampling.
+    logger.info(
+        "Trends [%s]: [%s] volume=SAMPLE_COUNT — counted on %d sampled posts "
+        "(cap=%d); not extrapolated to full corpus.",
+        tracker_id, range_label, len(total_range_texts), _MAX_POSTS_PER_RANGE,
+    )
 
     curr_window_counts = _window_counts(window_texts[0])
     prev_window_arrays = [_window_counts(window_texts[w]) for w in range(1, min(4, num_windows))]
@@ -525,7 +547,36 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
     for range_label, lookback_h, win_h, use_buckets in FETCH_CONFIGS:
         t_range = time.monotonic()
         window_start = now_utc - timedelta(hours=lookback_h)
+        window_end   = now_utc
         window_start_iso = window_start.isoformat()
+        window_end_iso   = window_end.isoformat()
+
+        # ── Diagnostic: log window boundaries & bucket layout (Task 3) ────────
+        if use_buckets:
+            n_buckets = 24
+            posts_per_bucket = 80
+            bucket_size_h = lookback_h / n_buckets
+            bucket_boundaries = [
+                (
+                    (window_start + timedelta(hours=bucket_size_h * i)).isoformat(),
+                    (window_start + timedelta(hours=bucket_size_h * (i + 1))).isoformat(),
+                )
+                for i in range(n_buckets)
+            ]
+            logger.info(
+                "Trends [%s]: [%s] WINDOW %s → %s | %d buckets × %d posts/bucket "
+                "| bucket_size=%.2fh | first_bucket=(%s → %s) | last_bucket=(%s → %s).",
+                tracker_id, range_label,
+                window_start_iso, window_end_iso,
+                n_buckets, posts_per_bucket, bucket_size_h,
+                bucket_boundaries[0][0], bucket_boundaries[0][1],
+                bucket_boundaries[-1][0], bucket_boundaries[-1][1],
+            )
+        else:
+            logger.info(
+                "Trends [%s]: [%s] WINDOW %s → %s | single bounded query (limit=2000).",
+                tracker_id, range_label, window_start_iso, window_end_iso,
+            )
 
         # ── Fetch ─────────────────────────────────────────────────────────────
         try:
@@ -533,7 +584,7 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
                 raw_posts = get_posts_for_trends_bucketed(
                     tracker_id=tracker_id,
                     window_start=window_start,
-                    window_end=now_utc,
+                    window_end=window_end,
                     n_buckets=24,
                     posts_per_bucket=80,
                 )
@@ -562,9 +613,20 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
 
         earliest_dt = valid_posts[-1][0] if valid_posts else None
         latest_dt   = valid_posts[0][0]  if valid_posts else None
+
+        # ── Diagnostic: content fingerprint to detect identical post sets (Task 3) ──
+        if valid_posts:
+            post_bodies_sorted = sorted(body for _, body in valid_posts)
+            content_hash = hashlib.md5(
+                "\n".join(post_bodies_sorted).encode("utf-8", errors="replace")
+            ).hexdigest()
+        else:
+            content_hash = "(empty)"
         logger.info(
-            "Trends [%s]: [%s] %d posts fetched (from %s to %s).",
-            tracker_id, range_label, len(valid_posts), earliest_dt, latest_dt,
+            "Trends [%s]: [%s] %d posts fetched | earliest=%s | latest=%s | "
+            "content_hash(sorted_bodies_md5)=%s.",
+            tracker_id, range_label, len(valid_posts),
+            earliest_dt, latest_dt, content_hash,
         )
 
         if not valid_posts:
