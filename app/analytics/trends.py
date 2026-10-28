@@ -5,7 +5,7 @@
 #
 # Performance notes:
 #   - All three ranges are processed from separate, range-specific DB fetches.
-#   - Each range is capped to the newest 2 000 posts before TF-IDF.
+#   - Each range is capped to the newest 800 posts before TF-IDF.
 #   - Term volume per window is computed with a single vectorized matrix pass
 #     instead of per-term regex loops.
 #   - Dictionary is loaded lazily on first use (ALL qualifying words, no cap),
@@ -206,7 +206,7 @@ RANGE_CONFIGS = [
     ("30D", 720, 72),  # 30 days lookback, 10 windows of 72 hours
 ]
 
-_MAX_POSTS_PER_RANGE = 2_000
+_MAX_POSTS_PER_RANGE = 800
 
 
 def _clean_text(text: str) -> str:
@@ -231,12 +231,12 @@ def _analyze_range(
 ) -> list[dict[str, Any]]:
     """
     Compute trend metrics for a specific time range using vectorized counts.
-    Caps to the newest 2 000 posts. Returns trend dicts with volume >= 3.
+    Caps to the newest 800 posts. Returns trend dicts with volume >= 3.
     """
     if not valid_posts:
         return []
 
-    # Cap each range at 2 000 posts before TF-IDF
+    # Cap each range at 800 posts before TF-IDF
     if len(valid_posts) > _MAX_POSTS_PER_RANGE:
         valid_posts = valid_posts[:_MAX_POSTS_PER_RANGE]
 
@@ -264,7 +264,7 @@ def _analyze_range(
     # ── TF-IDF vectorizer fit on full range ─────────────────────────────────
     try:
         vec = TfidfVectorizer(
-            max_features=2000,
+            max_features=500,
             ngram_range=(1, 2),
             stop_words=STOP_WORDS,
             min_df=3,
@@ -518,11 +518,11 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
     """
     Compute and store trends for a tracker for 24H, 7D, and 30D ranges.
 
-    Fetch strategy (memory-bounded — never more than ~2 000 posts in RAM
+    Fetch strategy (memory-bounded — never more than ~800 posts in RAM
     at once per range):
-    - 24H : one bounded DESC query for the newest 2 000 posts in the window.
-    - 7D  : 24-bucket evenly-spaced sample, ≤80 posts per bucket (~1 920 total).
-    - 30D : 24-bucket evenly-spaced sample, ≤80 posts per bucket (~1 920 total).
+    - 24H : one bounded DESC query for the newest 800 posts in the window.
+    - 7D  : 12-bucket evenly-spaced sample, ≤50 posts per bucket (~600 total).
+    - 30D : 12-bucket evenly-spaced sample, ≤50 posts per bucket (~600 total).
 
     After each range is processed its post list is deleted and gc.collect()
     is called before the next range begins.
@@ -536,9 +536,9 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
     # ── Per-range fetch config ────────────────────────────────────────────────
     # (range_label, lookback_hours, win_hours, use_bucketed_fetch)
     FETCH_CONFIGS = [
-        ("24H",  24,   1,  False),  # newest 2 000, single bounded query
-        ("7D",   168,  24, True),   # 24-bucket evenly-spaced sample
-        ("30D",  720,  72, True),   # 24-bucket evenly-spaced sample
+        ("24H",  24,   1,  False),  # newest 800, single bounded query
+        ("7D",   168,  24, True),   # 12-bucket evenly-spaced sample
+        ("30D",  720,  72, True),   # 12-bucket evenly-spaced sample
     ]
 
     total_posts_analyzed = 0
@@ -553,8 +553,8 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
 
         # ── Diagnostic: log window boundaries & bucket layout (Task 3) ────────
         if use_buckets:
-            n_buckets = 24
-            posts_per_bucket = 80
+            n_buckets = 12
+            posts_per_bucket = 50
             bucket_size_h = lookback_h / n_buckets
             bucket_boundaries = [
                 (
@@ -574,7 +574,7 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
             )
         else:
             logger.info(
-                "Trends [%s]: [%s] WINDOW %s → %s | single bounded query (limit=2000).",
+                "Trends [%s]: [%s] WINDOW %s → %s | single bounded query (limit=800).",
                 tracker_id, range_label, window_start_iso, window_end_iso,
             )
 
@@ -585,12 +585,12 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
                     tracker_id=tracker_id,
                     window_start=window_start,
                     window_end=window_end,
-                    n_buckets=24,
-                    posts_per_bucket=80,
+                    n_buckets=12,
+                    posts_per_bucket=50,
                 )
             else:
                 raw_posts = get_posts_for_trends(
-                    tracker_id, window_start_iso, limit=2000
+                    tracker_id, window_start_iso, limit=800
                 )
         except Exception as exc:
             logger.error("Trends [%s]: [%s] fetch failed — %s", tracker_id, range_label, exc)
@@ -682,6 +682,9 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
         tracker_id, total_secs, total_rows_written,
     )
     _log_memory("end", tracker_id)
+
+    # Explicit memory reclaim at the very end
+    import gc
     gc.collect()
 
     return {

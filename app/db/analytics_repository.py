@@ -77,15 +77,15 @@ def get_posts_for_trends_bucketed(
     tracker_id: str,
     window_start: datetime,
     window_end: datetime,
-    n_buckets: int = 24,
-    posts_per_bucket: int = 80,
+    n_buckets: int = 12,
+    posts_per_bucket: int = 50,
 ) -> list[dict[str, Any]]:
     """
     Evenly-sampled fetch across [window_start, window_end).
 
     Divides the window into *n_buckets* equal slices and fetches up to
     *posts_per_bucket* posts from each bucket (oldest-first).  This gives a
-    time-stratified sample of at most n_buckets × posts_per_bucket ≈ 1 920
+    time-stratified sample of at most n_buckets × posts_per_bucket ≈ 600
     posts that spans the *entire* window, so 7D and 30D trends reflect
     different epochs rather than only the most-recent hours.
 
@@ -139,26 +139,20 @@ def insert_trends_batch(trends: list[dict[str, Any]]) -> None:
 
 
 @_db_retry
-def get_interactions_for_network(tracker_id: str, since_iso: str) -> list[dict[str, Any]]:
-    """Fetch interactions within the last 7 days for network analysis using paged fetching."""
-    page_size = 1000
-    all_interactions: list[dict[str, Any]] = []
-    start = 0
-    while True:
-        res = (
-            supabase.table("interactions")
-            .select("source_hash, target_hash")
-            .eq("tracker_id", tracker_id)
-            .gte("occurred_at", since_iso)
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-        batch = res.data or []
-        all_interactions.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
-    return all_interactions
+def get_interactions_for_network(
+    tracker_id: str, since_iso: str, limit: int = 800
+) -> list[dict[str, Any]]:
+    """Fetch newest interactions (up to limit) within since_iso for network analysis."""
+    res = (
+        supabase.table("interactions")
+        .select("source_hash, target_hash")
+        .eq("tracker_id", tracker_id)
+        .gte("occurred_at", since_iso)
+        .order("occurred_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
 
 
 @_db_retry

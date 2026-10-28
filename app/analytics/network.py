@@ -28,9 +28,11 @@ def analyze_network(tracker_id: str) -> dict[str, int]:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
     try:
-        interactions = get_interactions_for_network(tracker_id, cutoff)
+        interactions = get_interactions_for_network(tracker_id, cutoff, limit=800)
     except Exception as exc:
         logger.error("Tracker %s: failed to fetch interactions: %s", tracker_id, exc)
+        import gc
+        gc.collect()
         return {"nodes": 0, "edges": 0}
 
     # Count interaction frequencies as directed edge weights
@@ -48,6 +50,8 @@ def analyze_network(tracker_id: str) -> dict[str, int]:
             tracker_id,
             len(edge_counts),
         )
+        import gc
+        gc.collect()
         return {"nodes": 0, "edges": 0}
 
     # Construct directed graph
@@ -55,11 +59,25 @@ def analyze_network(tracker_id: str) -> dict[str, int]:
     for (s, t), weight in edge_counts.items():
         g.add_edge(s, t, weight=weight)
 
+    # Prune graph to top 300 nodes by degree centrality before running PageRank and Louvain
+    if g.number_of_nodes() > 300:
+        deg_centrality = nx.degree_centrality(g)
+        top_300_nodes = set(
+            sorted(deg_centrality, key=deg_centrality.get, reverse=True)[:300]
+        )
+        g = g.subgraph(top_300_nodes).copy()
+        logger.info(
+            "Tracker %s: network graph pruned from %d to %d nodes by degree centrality.",
+            tracker_id, len(deg_centrality), g.number_of_nodes(),
+        )
+
     # Compute PageRank (alpha=0.85)
     try:
         pr = nx.pagerank(g, alpha=0.85, weight="weight")
     except Exception as exc:
         logger.error("Tracker %s: PageRank computation failed: %s", tracker_id, exc)
+        import gc
+        gc.collect()
         return {"nodes": 0, "edges": 0}
 
     # Compute Louvain communities on undirected projection with fixed seed
@@ -107,7 +125,12 @@ def analyze_network(tracker_id: str) -> dict[str, int]:
             "Tracker %s: upserted %d network nodes and %d edges.",
             tracker_id, len(nodes_payload), len(edges_payload),
         )
-        return {"nodes": len(nodes_payload), "edges": len(edges_payload)}
+        res = {"nodes": len(nodes_payload), "edges": len(edges_payload)}
     except Exception as exc:
         logger.error("Tracker %s: failed to save network data to DB: %s", tracker_id, exc)
-        return {"nodes": 0, "edges": 0}
+        res = {"nodes": 0, "edges": 0}
+
+    # Explicit memory reclaim at the very end
+    import gc
+    gc.collect()
+    return res
