@@ -1,9 +1,10 @@
 # analytics/network.py
 # Network & influence analysis for social intelligence.
-# Builds a directed graph from interactions (last 7 days), computes PageRank
+# Builds a directed graph from interactions (last N days), computes PageRank
 # and Louvain communities, and saves the top 200 nodes and their edges.
 
 import logging
+import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -20,12 +21,50 @@ from app.db.analytics_repository import (
 logger = logging.getLogger(__name__)
 
 
-def analyze_network(tracker_id: str) -> dict[str, int]:
+def _parse_timeframe_days(timeframe: str | int | None) -> int:
+    """
+    Dynamically parse lookback days from strings like '40D', '30D', '7D', '24H',
+    or integers. Defaults to 7 days if unspecified or unparseable.
+    """
+    if isinstance(timeframe, int):
+        return max(1, timeframe)
+    if isinstance(timeframe, float):
+        return max(1, int(timeframe))
+    if not timeframe:
+        return 7
+
+    tf = str(timeframe).strip().upper()
+    # Match '40D', '40DAYS', '40 D'
+    m_days = re.match(r"^(\d+)\s*D", tf)
+    if m_days:
+        return max(1, int(m_days.group(1)))
+
+    # Match '24H', '48HOURS'
+    m_hours = re.match(r"^(\d+)\s*H", tf)
+    if m_hours:
+        return max(1, int(m_hours.group(1)) // 24)
+
+    # Any standalone integer
+    m_num = re.search(r"\d+", tf)
+    if m_num:
+        return max(1, int(m_num.group()))
+
+    return 7
+
+
+def analyze_network(tracker_id: str, timeframe: str | int = "7D") -> dict[str, int]:
     """
     Compute and store PageRank and Louvain communities for a tracker.
+    Dynamically parses the timeframe parameter (e.g., '40D', '30D', '7D')
+    and subtracts the requested number of days for historical lookback.
     Returns {"nodes": count, "edges": count}.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    days = _parse_timeframe_days(timeframe)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    logger.info(
+        "Tracker %s: analyzing network for timeframe '%s' (%d days lookback, cutoff: %s).",
+        tracker_id, timeframe, days, cutoff,
+    )
 
     try:
         interactions = get_interactions_for_network(tracker_id, cutoff, limit=800)

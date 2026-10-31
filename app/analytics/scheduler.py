@@ -11,12 +11,12 @@ from app.analytics.network import analyze_network
 logger = logging.getLogger(__name__)
 
 
-def run_analytics(tracker_id: str) -> dict[str, Any]:
+def run_analytics(tracker_id: str, timeframe: str | int = "7D") -> dict[str, Any]:
     """
     Execute trend detection and network influence analysis for a tracker.
     Returns metrics from trends (posts, windows, terms found/written) and network.
     """
-    logger.info("Starting analytics pipeline for tracker %s.", tracker_id)
+    logger.info("Starting analytics pipeline for tracker %s (timeframe=%s).", tracker_id, timeframe)
     summary: dict[str, Any] = {
         "tracker_id": tracker_id,
         "network_nodes": 0,
@@ -31,7 +31,7 @@ def run_analytics(tracker_id: str) -> dict[str, Any]:
 
     # 2. Network & Influence Analysis
     try:
-        net_res = analyze_network(tracker_id)
+        net_res = analyze_network(tracker_id, timeframe=timeframe)
         summary["network_nodes"] = net_res.get("nodes", 0)
         summary["network_edges"] = net_res.get("edges", 0)
     except Exception as exc:

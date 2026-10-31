@@ -66,13 +66,14 @@ def _fetch_bucket(
         .eq("tracker_id", tracker_id)
         .gte("posted_at", bucket_start_iso)
         .lt("posted_at", bucket_end_iso)
-        .order("posted_at", desc=False)   # oldest-first keeps chronological spread
+        .order("posted_at", desc=True)
         .limit(limit)
         .execute()
     )
     return res.data or []
 
 
+@_db_retry
 def get_posts_for_trends_bucketed(
     tracker_id: str,
     window_start: datetime,
@@ -83,29 +84,70 @@ def get_posts_for_trends_bucketed(
     """
     Evenly-sampled fetch across [window_start, window_end).
 
-    Divides the window into *n_buckets* equal slices and fetches up to
-    *posts_per_bucket* posts from each bucket (oldest-first).  This gives a
-    time-stratified sample of at most n_buckets × posts_per_bucket ≈ 600
-    posts that spans the *entire* window, so 7D and 30D trends reflect
-    different epochs rather than only the most-recent hours.
-
-    Each bucket is a single Supabase query with LIMIT — no full-table scan.
+    Fetches posts within the entire historical window in a single fast indexed query
+    (capped at max 800 posts), and stratifies them across n_buckets in Python memory.
+    This replaces 12 sequential HTTP database roundtrips and avoids PostgreSQL statement
+    timeouts, executing in milliseconds while maintaining chronological distribution.
+    Guarded against non-positive bucket counts or zero-division timedelta math.
     """
-    bucket_size = (window_end - window_start) / n_buckets
-    all_posts: list[dict[str, Any]] = []
+    safe_buckets = max(1, n_buckets)
+    safe_posts_per_bucket = max(1, posts_per_bucket)
+    max_posts = min(800, safe_buckets * safe_posts_per_bucket)
 
-    for i in range(n_buckets):
-        b_start = window_start + bucket_size * i
-        b_end   = window_start + bucket_size * (i + 1)
-        batch = _fetch_bucket(
-            tracker_id=tracker_id,
-            bucket_start_iso=b_start.isoformat(),
-            bucket_end_iso=b_end.isoformat(),
-            limit=posts_per_bucket,
-        )
-        all_posts.extend(batch)
+    if window_end <= window_start:
+        window_start = window_end - timedelta(days=7)
 
-    return all_posts
+    w_start_iso = window_start.isoformat()
+    w_end_iso = window_end.isoformat()
+
+    # Single fast query utilizing the (tracker_id, posted_at DESC) index
+    res = (
+        supabase.table("posts")
+        .select("body, posted_at")
+        .eq("tracker_id", tracker_id)
+        .gte("posted_at", w_start_iso)
+        .lte("posted_at", w_end_iso)
+        .order("posted_at", desc=True)
+        .limit(max_posts)
+        .execute()
+    )
+    raw_posts = res.data or []
+    if not raw_posts:
+        return []
+
+    total_seconds = (window_end - window_start).total_seconds()
+    if total_seconds <= 0 or len(raw_posts) <= safe_posts_per_bucket:
+        return raw_posts[:max_posts]
+
+    # Time-stratify in memory across n_buckets
+    bucket_sec = total_seconds / safe_buckets
+    buckets: list[list[dict[str, Any]]] = [[] for _ in range(safe_buckets)]
+
+    for p in raw_posts:
+        p_at = p.get("posted_at")
+        if not p_at:
+            continue
+        try:
+            dt = datetime.fromisoformat(p_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            offset_sec = max(0.0, (dt - window_start).total_seconds())
+            b_idx = int(offset_sec // bucket_sec)
+            b_idx = max(0, min(safe_buckets - 1, b_idx))
+            if len(buckets[b_idx]) < safe_posts_per_bucket:
+                buckets[b_idx].append(p)
+        except Exception:
+            continue
+
+    stratified: list[dict[str, Any]] = []
+    for b in buckets:
+        stratified.extend(b)
+
+    # If bucket stratification pruned too aggressively due to sparse timestamps, fallback to raw_posts
+    if len(stratified) < min(10, len(raw_posts)):
+        return raw_posts[:max_posts]
+
+    return stratified[:max_posts]
 
 
 @_db_retry

@@ -242,21 +242,22 @@ def _analyze_range(
 
     newest_post_dt = valid_posts[0][0]  # already sorted desc
     anchor_end = newest_post_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    period_start_iso = (anchor_end - timedelta(hours=win_hours)).isoformat()
+    safe_win_hours = max(1, win_hours)
+    safe_lookback_hours = max(safe_win_hours, lookback_hours)
+    period_start_iso = (anchor_end - timedelta(hours=safe_win_hours)).isoformat()
 
-    num_windows = max(4, lookback_hours // win_hours)
+    num_windows = max(4, safe_lookback_hours // safe_win_hours)
 
     # Assign each post to its window index
     window_texts: list[list[str]] = [[] for _ in range(num_windows)]
     total_range_texts: list[str] = []
 
     for dt, body in valid_posts:
-        diff_hours = (anchor_end - dt).total_seconds() / 3600.0
+        diff_hours = max(0.0, (anchor_end - dt).total_seconds() / 3600.0)
         cleaned = _clean_text(body)
         total_range_texts.append(cleaned)
-        w_idx = max(0, int(diff_hours // win_hours))
-        if 0 <= w_idx < num_windows:
-            window_texts[w_idx].append(cleaned)
+        w_idx = max(0, min(num_windows - 1, int(diff_hours // safe_win_hours)))
+        window_texts[w_idx].append(cleaned)
 
     if len(total_range_texts) < 3:
         return []
@@ -514,9 +515,61 @@ def _log_memory(label: str, tracker_id: str) -> float:
     return mb
 
 
-def analyze_trends(tracker_id: str) -> dict[str, Any]:
+def _parse_trend_timeframe(timeframe: str | int | None) -> list[tuple[str, int, int, bool]]:
     """
-    Compute and store trends for a tracker for 24H, 7D, and 30D ranges.
+    Parse timeframe parameter into fetch configurations:
+    (range_label, lookback_hours, win_hours, use_bucketed_fetch).
+    If timeframe is None or 'ALL', returns standard configs for 24H, 7D, and 30D.
+    Otherwise parses dynamic or standard timeframes (e.g. '7D', '24H', '30D', '40D').
+    """
+    if not timeframe or str(timeframe).strip().upper() == "ALL":
+        return [
+            ("24H",  24,   1,  False),  # newest 800, single bounded query
+            ("7D",   168,  24, True),   # 12-bucket evenly-spaced sample
+            ("30D",  720,  72, True),   # 12-bucket evenly-spaced sample
+        ]
+
+    tf = str(timeframe).strip().upper()
+    if tf == "24H":
+        return [("24H", 24, 1, False)]
+    if tf == "7D":
+        return [("7D", 168, 24, True)]
+    if tf == "30D":
+        return [("30D", 720, 72, True)]
+
+    # Dynamic days parsing (e.g. '40D', '14D')
+    m_days = re.match(r"^(\d+)\s*D", tf)
+    if m_days:
+        days = max(1, int(m_days.group(1)))
+        lookback_h = days * 24
+        win_h = max(1, 24 if days <= 14 else (lookback_h // 10))
+        return [(f"{days}D", lookback_h, win_h, True)]
+
+    # Dynamic hours parsing (e.g. '48H')
+    m_hours = re.match(r"^(\d+)\s*H", tf)
+    if m_hours:
+        hours = max(1, int(m_hours.group(1)))
+        win_h = max(1, hours // 24)
+        return [(f"{hours}H", hours, win_h, False)]
+
+    # Numeric fallback: interpret as days
+    if isinstance(timeframe, (int, float)):
+        days = max(1, int(timeframe))
+        lookback_h = days * 24
+        win_h = max(1, 24 if days <= 14 else (lookback_h // 10))
+        return [(f"{days}D", lookback_h, win_h, True)]
+
+    return [
+        ("24H",  24,   1,  False),
+        ("7D",   168,  24, True),
+        ("30D",  720,  72, True),
+    ]
+
+
+def analyze_trends(tracker_id: str, timeframe: str | int | None = None) -> dict[str, Any]:
+    """
+    Compute and store trends for a tracker for 24H, 7D, and 30D ranges
+    (or a specific requested timeframe such as '7D', '30D', '40D').
 
     Fetch strategy (memory-bounded — never more than ~800 posts in RAM
     at once per range):
@@ -528,18 +581,14 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
     is called before the next range begins.
     """
     t_start = time.monotonic()
-    logger.info("Trends [%s]: starting analysis.", tracker_id)
+    logger.info("Trends [%s]: starting analysis (timeframe=%s).", tracker_id, timeframe)
     _log_memory("start", tracker_id)
 
     now_utc = datetime.now(timezone.utc)
 
     # ── Per-range fetch config ────────────────────────────────────────────────
     # (range_label, lookback_hours, win_hours, use_bucketed_fetch)
-    FETCH_CONFIGS = [
-        ("24H",  24,   1,  False),  # newest 800, single bounded query
-        ("7D",   168,  24, True),   # 12-bucket evenly-spaced sample
-        ("30D",  720,  72, True),   # 12-bucket evenly-spaced sample
-    ]
+    FETCH_CONFIGS = _parse_trend_timeframe(timeframe)
 
     total_posts_analyzed = 0
     total_rows_written = 0
@@ -555,7 +604,7 @@ def analyze_trends(tracker_id: str) -> dict[str, Any]:
         if use_buckets:
             n_buckets = 12
             posts_per_bucket = 50
-            bucket_size_h = lookback_h / n_buckets
+            bucket_size_h = lookback_h / max(1, n_buckets)
             bucket_boundaries = [
                 (
                     (window_start + timedelta(hours=bucket_size_h * i)).isoformat(),

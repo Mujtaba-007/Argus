@@ -224,16 +224,17 @@ def _get_tracker_analytics_lock(tracker_id: str) -> asyncio.Lock:
 
 
 @app.post("/run-analytics", tags=["ops"])
-async def trigger_analytics(tracker_id: str | None = None) -> dict[str, Any]:
+async def trigger_analytics(tracker_id: str | None = None, timeframe: str | None = None) -> dict[str, Any]:
     """
     Kick off trend, network, and demographic analytics in the background and return immediately.
     If tracker_id is provided, runs for that tracker only.
     If omitted, runs across all active trackers.
+    If timeframe is provided (e.g. '7D', '30D', '40D'), customizes historical lookback window.
     Enforces a per-tracker asyncio.Lock (returns {"status":"already_running"} if active).
     Enforces a 5-minute throttle (returns {"status":"throttled"} if run < 5m ago).
     """
     try:
-        logger.info("POST /run-analytics triggered for tracker_id=%s.", tracker_id)
+        logger.info("POST /run-analytics triggered for tracker_id=%s, timeframe=%s.", tracker_id, timeframe)
 
         # 1. Determine target trackers
         targets: list[str]
@@ -279,7 +280,7 @@ async def trigger_analytics(tracker_id: str | None = None) -> dict[str, Any]:
                 # Trends analysis in worker thread
                 try:
                     from app.analytics.trends import analyze_trends
-                    trends_res = await asyncio.to_thread(analyze_trends, tid)
+                    trends_res = await asyncio.to_thread(analyze_trends, tid, timeframe)
                     logger.info("Background analytics [%s] trends done: %s", tid, trends_res)
                 except Exception as exc:
                     logger.error("Background analytics [%s] trends failed: %s", tid, exc)
@@ -287,7 +288,7 @@ async def trigger_analytics(tracker_id: str | None = None) -> dict[str, Any]:
                 # Network, demographics & alerts in worker thread via scheduler
                 try:
                     from app.analytics.scheduler import run_analytics
-                    sched_res = await asyncio.to_thread(run_analytics, tid)
+                    sched_res = await asyncio.to_thread(run_analytics, tid, timeframe or "7D")
                     logger.info("Background analytics [%s] pipeline done: %s", tid, sched_res)
                 except Exception as exc:
                     logger.error("Background analytics [%s] pipeline failed: %s", tid, exc)
@@ -311,6 +312,17 @@ async def trigger_analytics(tracker_id: str | None = None) -> dict[str, Any]:
     except Exception as e:
         logger.exception("Error in /run-analytics: %s", e)
         return {"status": "error", "detail": str(e)}
+
+
+@app.post("/run-network", tags=["ops"])
+async def trigger_network(tracker_id: str, timeframe: str = "7D") -> dict[str, Any]:
+    """
+    Manually trigger network analysis for a single tracker with customizable timeframe (e.g. 7D, 30D, 40D).
+    """
+    logger.info("POST /run-network triggered for tracker_id=%s, timeframe=%s", tracker_id, timeframe)
+    from app.analytics.network import analyze_network
+    result = await asyncio.to_thread(analyze_network, tracker_id, timeframe)
+    return result
 
 
 @app.post("/run-alerts", tags=["ops"])
