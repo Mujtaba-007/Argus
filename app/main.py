@@ -143,6 +143,19 @@ async def _background_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Argus backend starting up.")
+
+    # ── Pre-warm the NLP dictionary in a worker thread ──────────────────────
+    # Loads and caches the 358k-word gzipped word list exactly once at startup,
+    # before any request is handled.  Prevents the *first* /run-analytics call
+    # from blocking a worker thread for ~100–300 ms of .gz decompression, which
+    # could otherwise compete with Render's 5-second health-check liveness probe.
+    try:
+        from app.analytics.trends import _get_english_words
+        await asyncio.to_thread(_get_english_words)
+        logger.info("NLP dictionary pre-warmed successfully.")
+    except Exception as _dict_exc:
+        logger.warning("NLP dictionary pre-warm failed (non-fatal): %s", _dict_exc)
+
     loop_task = asyncio.create_task(_background_loop())
     try:
         yield  # server is running; handle requests here

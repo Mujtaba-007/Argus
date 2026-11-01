@@ -18,6 +18,7 @@ import gzip
 import hashlib
 import logging
 import re
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -119,6 +120,7 @@ DOMAIN_WHITELIST: set[str] = {
 DATA_DIR = Path(__file__).resolve().parent / "data"
 WORDS_FILE = DATA_DIR / "words.txt.gz"
 _ENGLISH_WORDS_CACHE: frozenset[str] | None = None
+_ENGLISH_WORDS_LOCK = threading.Lock()  # prevents double-load under concurrent cold starts
 
 # Words to verify are present in the dictionary after loading (Task 2 self-check).
 _DICT_SELFCHECK_WORDS = ("exam", "result", "railway", "station", "answer")
@@ -128,6 +130,13 @@ def _get_english_words() -> frozenset[str]:
     """
     Load and cache the English word list as a frozenset.
 
+    Caching strategy:
+    - Module-level global ``_ENGLISH_WORDS_CACHE`` checked first (lock-free fast path).
+    - ``_ENGLISH_WORDS_LOCK`` (threading.Lock) prevents duplicate loads when two
+      threads race on the very first call (e.g. lifespan pre-warm + first request).
+    - Called once at startup via ``asyncio.to_thread`` in main.py lifespan so it
+      is warm before Render's health-check probe arrives.
+
     Filtering rules applied once at load time:
     - Lowercase alphabetic characters only (no digits/hyphens/apostrophes).
     - Length 3–15 characters.
@@ -136,48 +145,56 @@ def _get_english_words() -> frozenset[str]:
     to free the intermediate list memory.
     """
     global _ENGLISH_WORDS_CACHE
+    # Fast path — already loaded (no lock needed; reads are atomic in CPython)
     if _ENGLISH_WORDS_CACHE is not None:
         return _ENGLISH_WORDS_CACHE
 
-    if WORDS_FILE.exists():
-        try:
-            raw: list[str] = []
-            with gzip.open(WORDS_FILE, "rt", encoding="utf-8") as f:
-                for line in f:
-                    w = line.strip().lower()
-                    if w.isalpha() and 3 <= len(w) <= 15:
-                        raw.append(w)
-            _ENGLISH_WORDS_CACHE = frozenset(raw)
-            del raw  # release temporary list immediately
-            mem_mb = _get_process_memory_mb()
-            logger.info(
-                "Dictionary loaded: %d English words from %s. Process RSS: %.1f MB.",
-                len(_ENGLISH_WORDS_CACHE), WORDS_FILE, mem_mb,
-            )
-            # ── Startup self-check (Task 2) ──────────────────────────────────
-            missing = [w for w in _DICT_SELFCHECK_WORDS if w not in _ENGLISH_WORDS_CACHE]
-            if missing:
-                logger.warning(
-                    "Dictionary self-check FAILED — these expected words are MISSING: %s",
-                    missing,
-                )
-            else:
-                logger.info(
-                    "Dictionary self-check OK — all probe words present: %s",
-                    list(_DICT_SELFCHECK_WORDS),
-                )
+    # Slow path — acquire lock to prevent concurrent double-load
+    with _ENGLISH_WORDS_LOCK:
+        # Re-check inside lock in case another thread completed the load while
+        # we were waiting to acquire it.
+        if _ENGLISH_WORDS_CACHE is not None:
             return _ENGLISH_WORDS_CACHE
-        except Exception as exc:
-            logger.warning("Failed to load bundled words dictionary from %s: %s", WORDS_FILE, exc)
-    else:
-        logger.warning(
-            "Dictionary file missing at %s; falling back to sklearn stop-word set.",
-            WORDS_FILE,
-        )
 
-    # Fallback: sklearn's built-in stop words (tiny but always available)
-    _ENGLISH_WORDS_CACHE = frozenset(ENGLISH_STOP_WORDS)
-    return _ENGLISH_WORDS_CACHE
+        if WORDS_FILE.exists():
+            try:
+                raw: list[str] = []
+                with gzip.open(WORDS_FILE, "rt", encoding="utf-8") as f:
+                    for line in f:
+                        w = line.strip().lower()
+                        if w.isalpha() and 3 <= len(w) <= 15:
+                            raw.append(w)
+                _ENGLISH_WORDS_CACHE = frozenset(raw)
+                del raw  # release temporary list immediately
+                mem_mb = _get_process_memory_mb()
+                logger.info(
+                    "Dictionary loaded: %d English words from %s. Process RSS: %.1f MB.",
+                    len(_ENGLISH_WORDS_CACHE), WORDS_FILE, mem_mb,
+                )
+                # ── Startup self-check ────────────────────────────────────────
+                missing = [w for w in _DICT_SELFCHECK_WORDS if w not in _ENGLISH_WORDS_CACHE]
+                if missing:
+                    logger.warning(
+                        "Dictionary self-check FAILED — these expected words are MISSING: %s",
+                        missing,
+                    )
+                else:
+                    logger.info(
+                        "Dictionary self-check OK — all probe words present: %s",
+                        list(_DICT_SELFCHECK_WORDS),
+                    )
+                return _ENGLISH_WORDS_CACHE
+            except Exception as exc:
+                logger.warning("Failed to load bundled words dictionary from %s: %s", WORDS_FILE, exc)
+        else:
+            logger.warning(
+                "Dictionary file missing at %s; falling back to sklearn stop-word set.",
+                WORDS_FILE,
+            )
+
+        # Fallback: sklearn's built-in stop words (tiny but always available)
+        _ENGLISH_WORDS_CACHE = frozenset(ENGLISH_STOP_WORDS)
+        return _ENGLISH_WORDS_CACHE
 
 
 def _is_valid_word(word: str) -> bool:
