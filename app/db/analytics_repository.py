@@ -248,7 +248,7 @@ def get_authors_needing_profile(tracker_id: str, limit: int) -> list[dict[str, A
             h = r.get("author_hash")
             if h and h != "unknown":
                 all_post_authors.append(h)
-        if len(batch) < page_size:
+        if len(batch) < page_size or len(all_post_authors) >= 2000:
             break
         start += page_size
 
@@ -275,7 +275,7 @@ def get_authors_needing_profile(tracker_id: str, limit: int) -> list[dict[str, A
         )
         batch = res.data or []
         all_profiles.extend(batch)
-        if len(batch) < page_size:
+        if len(batch) < page_size or len(all_profiles) >= 2000:
             break
         start += page_size
 
@@ -320,7 +320,7 @@ def get_all_author_profiles(tracker_id: str) -> list[dict[str, Any]]:
         )
         batch = res.data or []
         all_profiles.extend(batch)
-        if len(batch) < page_size:
+        if len(batch) < page_size or len(all_profiles) >= 2000:
             break
         start += page_size
     return all_profiles
