@@ -91,7 +91,6 @@ async def fetch_new_messages(tracker: dict[str, Any]) -> list[dict[str, Any]]:
             return []
 
         max_fetch = settings.max_per_cycle if last_sync_dt else settings.first_run_limit
-        fetch_kwargs: dict[str, Any] = {"limit": max_fetch}
 
         logger.info(
             "Fetching messages -> channel='%s' (raw query='%s') | tracker_id=%s | last_sync_raw=%s | last_sync_dt=%s | limit=%d",
@@ -103,93 +102,150 @@ async def fetch_new_messages(tracker: dict[str, Any]) -> list[dict[str, Any]]:
         skipped_empty_text = 0
         skipped_date_cutoff = 0
 
-        async for message in client.iter_messages(channel, **fetch_kwargs):
-            if len(posts) >= max_fetch:
+        # Pagination loop: fetch up to 5 pages, each up to max_fetch messages.
+        # next_offset_id: Telegram message ID to use as the starting anchor for
+        # the next page (iter_messages returns messages strictly older than this ID).
+        # Initialised to 0 (== no offset) so the first page always starts from newest.
+        page = 0
+        reached_end = False
+        next_offset_id: int = 0        # 0 means "start from the channel head"
+        oldest_fetched_date: datetime | None = None
+        while page < 5:
+            page += 1
+            page_count = 0
+            # Build fetch kwargs for this page:
+            # - page 1 has next_offset_id=0, so offset_id is omitted (starts from newest).
+            # - subsequent pages pass offset_id=<id> to return only messages strictly
+            #   older than that value, walking backward through history.
+            page_fetch_kwargs: dict[str, Any] = {"limit": max_fetch}
+            if next_offset_id:
+                page_fetch_kwargs["offset_id"] = next_offset_id
+
+            async for message in client.iter_messages(channel, **page_fetch_kwargs):
+                raw_msg_count += 1
+                if not isinstance(message, Message):
+                    skipped_non_message += 1
+                    continue
+                if not message.text:
+                    skipped_empty_text += 1
+                    continue  # skip media-only messages
+
+                msg_date = message.date.replace(tzinfo=timezone.utc)
+
+                # Track oldest fetched date for logging
+                oldest_fetched_date = msg_date if (oldest_fetched_date is None or msg_date < oldest_fetched_date) else oldest_fetched_date
+
+                # Skip messages we've already processed.
+                if last_sync_dt and msg_date <= last_sync_dt:
+                    skipped_date_cutoff += 1
+                    reached_end = True
+                    break  # iter_messages returns newest-first, so we can stop here
+
+                # --- Per-message try/except: one bad message must not abort the batch ---
+                try:
+                    # Sum ALL reaction counts across every emoji used on this message.
+                    # message.reactions.results is a list of ReactionCount objects,
+                    # one per distinct emoji — we want the total, not just index [0].
+                    like_count = (
+                        sum(r.count for r in message.reactions.results)
+                        if message.reactions and message.reactions.results
+                        else 0
+                    )
+
+                    # reply_count: the `.replies` attribute is None on channels that
+                    # have comments disabled, so guard against that.
+                    reply_count = (
+                        message.replies.replies
+                        if message.replies and message.replies.replies is not None
+                        else 0
+                    )
+
+                    # reply_to_external_id: Telegram message ID of replied-to message
+                    reply_to_id = getattr(message, "reply_to_msg_id", None)
+                    if reply_to_id is None and getattr(message, "reply_to", None):
+                        reply_to_id = getattr(message.reply_to, "reply_to_msg_id", None)
+                    reply_to_external_id = str(reply_to_id) if reply_to_id else None
+
+                    # forwarded_from_hash: hashed sender/channel ID of forwarded source
+                    fwd_from = getattr(message, "fwd_from", None)
+                    fwd_source = None
+                    if fwd_from:
+                        from_id = getattr(fwd_from, "from_id", None)
+                        if from_id:
+                            fwd_source = (
+                                getattr(from_id, "user_id", None)
+                                or getattr(from_id, "channel_id", None)
+                                or getattr(from_id, "chat_id", None)
+                            )
+                        if not fwd_source:
+                            fwd_source = getattr(fwd_from, "channel_id", None) or getattr(fwd_from, "from_name", None)
+                    forwarded_from_hash = _hash_id(fwd_source) if fwd_source else None
+
+                    author_hash = _hash_id(message.sender_id) or "unknown"
+
+                    posts.append({
+                        "tracker_id": tracker_id,
+                        "platform": "telegram",
+                        "external_id": str(message.id),
+                        "author_hash": author_hash,
+                        "body": message.text,
+                        "lang": _detect_lang(message.text),
+                        "posted_at": msg_date.isoformat(),
+                        "like_count": like_count,
+                        "reply_count": reply_count,
+                        "share_count": message.forwards or 0,
+                        "reply_to_external_id": reply_to_external_id,
+                        "forwarded_from_hash": forwarded_from_hash,
+                    })
+                    page_count += 1
+
+                except:  # noqa: E722 – intentionally catch all exceptions per original logic
+                    logger.exception(
+                        "Failed processing message id=%s from '%s':",
+                        getattr(message, "id", "?"),
+                        channel,
+                    )
+
+                # If we've hit the per-cycle page limit, prepare for the next page.
+                if page_count >= max_fetch:
+                    # Remember the oldest message id of this page for offset.
+                    next_offset_id = message.id
+                    break
+
+            # End of async for loop for this page.
+            if reached_end:
+                break
+            if page_count < max_fetch:
+                # Fewer than max_fetch means channel history is fully exhausted.
+                reached_end = True
+                break
+            if not last_sync_dt:
+                # On first run (no last_sync_dt), do not paginate past first_run_limit.
+                reached_end = True
                 break
 
-            raw_msg_count += 1
-            if not isinstance(message, Message):
-                skipped_non_message += 1
-                continue
-            if not message.text:
-                skipped_empty_text += 1
-                continue  # skip media-only messages
-
-            msg_date = message.date.replace(tzinfo=timezone.utc)
-
-            # Skip messages we've already processed.
-            if last_sync_dt and msg_date <= last_sync_dt:
-                skipped_date_cutoff += 1
-                break  # iter_messages returns newest-first, so we can stop here
-
-            # --- Per-message try/except: one bad message must not abort the batch ---
-            try:
-                # Sum ALL reaction counts across every emoji used on this message.
-                # message.reactions.results is a list of ReactionCount objects,
-                # one per distinct emoji — we want the total, not just index [0].
-                like_count = (
-                    sum(r.count for r in message.reactions.results)
-                    if message.reactions and message.reactions.results
-                    else 0
-                )
-
-                # reply_count: the `.replies` attribute is None on channels that
-                # have comments disabled, so guard against that.
-                reply_count = (
-                    message.replies.replies
-                    if message.replies and message.replies.replies is not None
-                    else 0
-                )
-
-                # reply_to_external_id: Telegram message ID of replied-to message
-                reply_to_id = getattr(message, "reply_to_msg_id", None)
-                if reply_to_id is None and getattr(message, "reply_to", None):
-                    reply_to_id = getattr(message.reply_to, "reply_to_msg_id", None)
-                reply_to_external_id = str(reply_to_id) if reply_to_id else None
-
-                # forwarded_from_hash: hashed sender/channel ID of forwarded source
-                fwd_from = getattr(message, "fwd_from", None)
-                fwd_source = None
-                if fwd_from:
-                    from_id = getattr(fwd_from, "from_id", None)
-                    if from_id:
-                        fwd_source = (
-                            getattr(from_id, "user_id", None)
-                            or getattr(from_id, "channel_id", None)
-                            or getattr(from_id, "chat_id", None)
-                        )
-                    if not fwd_source:
-                        fwd_source = getattr(fwd_from, "channel_id", None) or getattr(fwd_from, "from_name", None)
-                forwarded_from_hash = _hash_id(fwd_source) if fwd_source else None
-
-                author_hash = _hash_id(message.sender_id) or "unknown"
-
-                posts.append({
-                    "tracker_id": tracker_id,
-                    "platform": "telegram",
-                    "external_id": str(message.id),
-                    "author_hash": author_hash,
-                    "body": message.text,
-                    "lang": _detect_lang(message.text),
-                    "posted_at": msg_date.isoformat(),
-                    "like_count": like_count,
-                    "reply_count": reply_count,
-                    "share_count": message.forwards or 0,
-                    "reply_to_external_id": reply_to_external_id,
-                    "forwarded_from_hash": forwarded_from_hash,
-                })
-
-            except Exception:
-                # Log the FULL traceback for this individual message so we can trace exact line and file
-                logger.exception(
-                    "Failed processing message id=%s from '%s':",
-                    getattr(message, "id", "?"), channel,
-                )
-
         logger.info(
-            "iter_messages finished for channel='%s': raw_received=%d, non_message=%d, empty_text=%d, cutoff_skipped=%d, posts_collected=%d",
-            channel, raw_msg_count, skipped_non_message, skipped_empty_text, skipped_date_cutoff, len(posts),
+            "iter_messages finished for channel='%s': pages=%d, raw_received=%d, non_message=%d, empty_text=%d, cutoff_skipped=%d, posts_collected=%d",
+            channel, page, raw_msg_count, skipped_non_message, skipped_empty_text, skipped_date_cutoff, len(posts),
         )
+
+        # Log final pagination outcome.
+        if reached_end:
+            logger.info(
+                "Tracker %s fully caught up this cycle (pages=%d, oldest_fetched_msg_date=%s, last_sync_dt=%s)",
+                tracker_id,
+                page,
+                oldest_fetched_date.isoformat() if oldest_fetched_date else "N/A",
+                last_sync_dt.isoformat() if last_sync_dt else "None",
+            )
+        else:
+            logger.warning(
+                "Tracker %s still has unfetched backlog past this cycle's limit (reached %d pages, oldest_fetched_msg_date=%s, last_sync_dt=%s)",
+                tracker_id,
+                page,
+                oldest_fetched_date.isoformat() if oldest_fetched_date else "N/A",
+                last_sync_dt.isoformat() if last_sync_dt else "None",
+            )
 
         # Fetch comments for recent channel posts if discussions are enabled
         parent_ids = [

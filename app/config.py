@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # Ingestion & Gemini rate limits / batching
     first_run_limit: int = 30
-    max_per_cycle: int = 50
+    max_per_cycle: int = 1000
 
     # Gemini model & rate limits
     # Model: gemini-2.0-flash-lite — fast, cheap, ideal for high-volume classification
