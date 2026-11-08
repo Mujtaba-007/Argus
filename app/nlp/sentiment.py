@@ -106,23 +106,6 @@ _limiter = _GeminiRateLimiter(
 # Prompt Templates & JSON Parsing
 # ---------------------------------------------------------------------------
 
-_SINGLE_PROMPT_TEMPLATE = """\
-You are a sentiment classifier for social-media posts.
-Classify the following text and reply with ONLY a valid JSON object — no markdown, no explanation.
-
-JSON schema:
-{{
-  "polarity":   "support" | "neutral" | "against",
-  "emotion":    "support" | "anxiety" | "excitement" | "anger" | "sarcasm" | "neutral",
-  "confidence": <float 0.0–1.0>
-}}
-
-Text to classify:
-\"\"\"
-{text}
-\"\"\"
-"""
-
 _BATCH_PROMPT_TEMPLATE = """\
 You are a sentiment classifier for social-media posts.
 Classify each of the following {count} posts and reply with ONLY a valid JSON array of {count} objects — no markdown, no explanation.
@@ -248,21 +231,3 @@ async def analyze_batch_async(texts: list[str]) -> list[SentimentResult] | None:
 
     return results
 
-
-async def analyze_single_async(text: str) -> SentimentResult | None:
-    """Async single-text classification. Returns None if call fails."""
-    if not text or not text.strip():
-        return _UNCLASSIFIED_ITEM.copy()
-
-    prompt = _SINGLE_PROMPT_TEMPLATE.format(text=text[:2000])
-
-    try:
-        async with _limiter.throttle():
-            raw_response = await generate_text_async(prompt)
-        parsed = _extract_json(raw_response)
-        if isinstance(parsed, dict):
-            return _validate_and_sanitize(parsed)
-        return _UNCLASSIFIED_ITEM.copy()
-    except Exception as exc:
-        logger.warning("Single sentiment analysis failed: %s", exc)
-        return None
