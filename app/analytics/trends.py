@@ -391,16 +391,14 @@ def _analyze_range(
                 velocity = 0.0
             else:
                 velocity = (v_curr - v_prev_avg) / v_prev_avg
-        # Cap velocity at +999% (9.99), especially for 7D/30D ranges
-        if velocity > 9.99:
-            velocity = 9.99
         prev_vols = [float(a[col_idx]) for a in prev_window_arrays]
         is_rising = bool(
             (sum(prev_vols) >= 2 or v_prev_avg >= 1.5)
             and velocity > 0.5
             and v_curr >= 3
         )
-        score = total_range_vol * (1.0 + max(velocity, 0.0))
+        # Cap score multiplier at 9.99 to avoid extreme ranking skew, while preserving real velocity
+        score = total_range_vol * (1.0 + max(min(velocity, 9.99), 0.0))
         term_stats.append({
             "tracker_id": tracker_id,
             "term": term,
