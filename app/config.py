@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     # Ingestion & Gemini rate limits / batching
     first_run_limit: int = 30
     max_per_cycle: int = 1000
+    max_sentiment_per_cycle: int = 300   # Max posts to analyze with Gemini in a single cycle
+    cycle_sentiment_timeout_seconds: float = 90.0  # Max seconds spent on Gemini sentiment per cycle
 
     # Gemini model & rate limits
     # Model: gemini-2.0-flash-lite — fast, cheap, ideal for high-volume classification

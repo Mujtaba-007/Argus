@@ -43,6 +43,11 @@ async def run_cycle() -> dict[str, Any]:
 
 async def _execute_cycle() -> dict[str, Any]:
     t_cycle_start = time.monotonic()
+    t_sentiment_start: float | None = None
+    sentiments_analyzed_this_cycle = 0
+    max_sentiment_per_cycle = getattr(settings, "max_sentiment_per_cycle", 300)
+    sentiment_timeout_seconds = getattr(settings, "cycle_sentiment_timeout_seconds", 90.0)
+
     summary: dict[str, Any] = {
         "trackers_processed": 0,
         "posts_added": 0,
@@ -146,7 +151,27 @@ async def _execute_cycle() -> dict[str, Any]:
         for i in range(0, total_new, batch_size):
             batch_num += 1
             batch = new_messages[i : i + batch_size]
-            sentiments = await analyze_batch_async([m["body"] for m in batch])
+
+            # Enforce per-cycle sentiment cap and hard time guard
+            can_analyze = True
+            if sentiments_analyzed_this_cycle >= max_sentiment_per_cycle:
+                can_analyze = False
+                logger.info(
+                    "Tracker %s: per-cycle sentiment cap reached (%d/%d posts). Ingesting batch %d/%d without sentiment (deferred to backfill).",
+                    tracker_id, sentiments_analyzed_this_cycle, max_sentiment_per_cycle, batch_num, total_batches,
+                )
+            elif t_sentiment_start is not None and (time.monotonic() - t_sentiment_start) >= sentiment_timeout_seconds:
+                can_analyze = False
+                logger.warning(
+                    "Tracker %s: cycle sentiment time guard triggered (%.1fs elapsed >= %.1fs). Deferring batch %d/%d to backfill.",
+                    tracker_id, time.monotonic() - t_sentiment_start, sentiment_timeout_seconds, batch_num, total_batches,
+                )
+
+            sentiments = None
+            if can_analyze:
+                if t_sentiment_start is None:
+                    t_sentiment_start = time.monotonic()
+                sentiments = await analyze_batch_async([m["body"] for m in batch])
 
             try:
                 inserted_posts = insert_posts_batch(batch)
@@ -173,15 +198,22 @@ async def _execute_cycle() -> dict[str, Any]:
                 ]
                 try:
                     insert_sentiments_batch(sentiment_rows)
+                    sentiments_analyzed_this_cycle += len(batch)
                     summary["sentiments_added"] += len(sentiment_rows)
                 except Exception as exc:
                     logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
                 logger.info("Tracker %s: batch %d/%d ok.", tracker_id, batch_num, total_batches)
             else:
-                logger.warning(
-                    "Tracker %s: batch %d/%d failed with Gemini. Skipping sentiment insertion for %d posts.",
-                    tracker_id, batch_num, total_batches, len(inserted_posts),
-                )
+                if not can_analyze:
+                    logger.info(
+                        "Tracker %s: batch %d/%d inserted without sentiment (deferred to backfill).",
+                        tracker_id, batch_num, total_batches,
+                    )
+                else:
+                    logger.warning(
+                        "Tracker %s: batch %d/%d failed with Gemini. Skipping sentiment insertion for %d posts.",
+                        tracker_id, batch_num, total_batches, len(inserted_posts),
+                    )
 
             # Insert interactions for replies and forwards
             _record_interactions(tracker_id, batch, inserted_posts)
@@ -341,10 +373,21 @@ async def sync_single_x_tracker(tracker: dict[str, Any]) -> dict[str, Any]:
     # Process batches
     batch_size = settings.gemini_batch_size
     tracker_posts_added = 0
+    sentiments_analyzed = 0
+    max_sentiment_per_cycle = getattr(settings, "max_sentiment_per_cycle", 300)
+    sentiment_timeout_seconds = getattr(settings, "cycle_sentiment_timeout_seconds", 90.0)
+    t_start = time.monotonic()
 
     for i in range(0, total_new, batch_size):
         batch = new_messages[i : i + batch_size]
-        sentiments = await analyze_batch_async([m["body"] for m in batch])
+
+        can_analyze = True
+        if sentiments_analyzed >= max_sentiment_per_cycle:
+            can_analyze = False
+        elif (time.monotonic() - t_start) >= sentiment_timeout_seconds:
+            can_analyze = False
+
+        sentiments = await analyze_batch_async([m["body"] for m in batch]) if can_analyze else None
 
         try:
             inserted_posts = insert_posts_batch(batch)
@@ -370,6 +413,7 @@ async def sync_single_x_tracker(tracker: dict[str, Any]) -> dict[str, Any]:
             ]
             try:
                 insert_sentiments_batch(sentiment_rows)
+                sentiments_analyzed += len(batch)
                 summary["sentiments_added"] += len(sentiment_rows)
             except Exception as exc:
                 logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
