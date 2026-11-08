@@ -750,7 +750,6 @@ def analyze_trends(tracker_id: str, timeframe: str | int | None = None) -> dict[
     _log_memory("end", tracker_id)
 
     # Explicit memory reclaim at the very end
-    import gc
     gc.collect()
 
     return {

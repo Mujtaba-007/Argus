@@ -88,7 +88,8 @@ async def fetch_new_posts(tracker: dict[str, Any]) -> List[dict[str, Any]]:
     params = {
         "query": tracker.get("query", "").strip(),
         "max_results": max_results,
-        "tweet.fields": "created_at,public_metrics,lang,author_id",
+        "tweet.fields": "created_at,public_metrics,lang,author_id,referenced_tweets,in_reply_to_user_id",
+        "expansions": "referenced_tweets.id,referenced_tweets.id.author_id",
     }
 
     url = "https://api.twitter.com/2/tweets/search/recent"
@@ -122,21 +123,53 @@ async def fetch_new_posts(tracker: dict[str, Any]) -> List[dict[str, Any]]:
             return []
 
     try:
-        data = resp.json().get("data", [])
+        resp_json = resp.json()
+        data = resp_json.get("data", [])
+        includes = resp_json.get("includes", {})
     except Exception as exc:
         msg = f"[X_WORKER] Unable to parse X response JSON for tracker {tracker.get('id')}: {exc}"
         print(msg)
         logger.error(msg)
         return []
 
+    # Map referenced tweet ID -> author ID from includes (if expanded)
+    referenced_author_map: dict[str, str] = {}
+    for inc_tweet in includes.get("tweets", []):
+        t_id = inc_tweet.get("id")
+        a_id = inc_tweet.get("author_id")
+        if t_id and a_id:
+            referenced_author_map[str(t_id)] = str(a_id)
+
     posts: List[dict] = []
     for tweet in data:
         try:
             metrics = tweet.get("public_metrics", {})
+
+            # Extract reply and retweet/quote interaction references (mutually exclusive)
+            reply_to_external_id: str | None = None
+            forwarded_from_hash: str | None = None
+
+            ref_tweets = tweet.get("referenced_tweets") or []
+            # 1. Replies: set reply_to_external_id (forwarded_from_hash remains None)
+            for ref in ref_tweets:
+                if ref.get("type") == "replied_to" and ref.get("id"):
+                    reply_to_external_id = str(ref.get("id"))
+                    break
+
+            # 2. Retweets/Quotes: set forwarded_from_hash (reply_to_external_id remains None)
+            if not reply_to_external_id:
+                for ref in ref_tweets:
+                    if ref.get("type") in ("retweeted", "quoted") and ref.get("id"):
+                        ref_id = str(ref.get("id"))
+                        target_author_id = referenced_author_map.get(ref_id)
+                        if target_author_id:
+                            forwarded_from_hash = _hash_id(target_author_id)
+                        break
+
             post = {
                 "tracker_id": tracker.get("id"),
                 "platform": "x",
-                "external_id": tweet.get("id"),
+                "external_id": str(tweet.get("id")),
                 "author_hash": _hash_id(tweet.get("author_id")) or "unknown",
                 "body": tweet.get("text", ""),
                 "lang": tweet.get("lang", "en"),
@@ -144,6 +177,8 @@ async def fetch_new_posts(tracker: dict[str, Any]) -> List[dict[str, Any]]:
                 "like_count": metrics.get("like_count", 0),
                 "reply_count": metrics.get("reply_count", 0),
                 "share_count": metrics.get("retweet_count", 0),
+                "reply_to_external_id": reply_to_external_id,
+                "forwarded_from_hash": forwarded_from_hash,
             }
             posts.append(post)
         except Exception as exc:
