@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     max_per_cycle: int = 1000
     max_sentiment_per_cycle: int = 300   # Max posts to analyze with Gemini in a single cycle
     cycle_sentiment_timeout_seconds: float = 90.0  # Max seconds spent on Gemini sentiment per cycle
+    min_sentiment_per_tracker: int = 20  # Minimum sentiment analysis budget per tracker to prevent starvation
+
+    # Health & watchdog timeouts
+    cycle_hard_timeout_seconds: float = 600.0         # Max duration for one full ingestion cycle
+    per_tracker_fetch_timeout_seconds: float = 120.0  # Max duration for a single tracker message fetch
+    health_stale_minutes: int = 20                    # Alert / 503 if no cycle completed in this window
 
     # Gemini model & rate limits
     # Model: gemini-2.0-flash-lite — fast, cheap, ideal for high-volume classification

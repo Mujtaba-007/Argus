@@ -14,9 +14,11 @@ import logging
 import logging.config
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 # Import config first — if any env var is missing this raises immediately
 # and the app refuses to start with a clear error message.
@@ -107,30 +109,73 @@ async def _run_scheduled_alerts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Background loop
+# Background loop & watchdog state
 # ---------------------------------------------------------------------------
+
+app_booted_at: datetime = datetime.now(timezone.utc)
+last_cycle_started_at: datetime | None = None
+last_cycle_finished_at: datetime | None = None
+_loop_task: asyncio.Task | None = None
+_is_shutting_down: bool = False
+
+
+def _on_loop_task_done(task: asyncio.Task) -> None:
+    """Supervisor callback to restart the background loop if it unexpectedly exits."""
+    global _loop_task
+    if _is_shutting_down:
+        return
+    if task.cancelled():
+        logger.warning("Background loop task was cancelled. Restarting...")
+    else:
+        exc = task.exception()
+        if exc:
+            logger.critical("Loop task died - restarting: %s", exc, exc_info=exc)
+        else:
+            logger.warning("Loop task died - restarting (task completed unexpectedly).")
+
+    try:
+        _loop_task = asyncio.create_task(_background_loop())
+        _loop_task.add_done_callback(_on_loop_task_done)
+    except Exception as create_exc:
+        logger.critical("Failed to restart background loop task: %s", create_exc)
+
 
 async def _background_loop() -> None:
     """
     Runs forever, triggering a full ingestion + alert-evaluation cycle every
-    CYCLE_INTERVAL_SECONDS. Exceptions inside run_cycle are caught there; this
-    loop only catches unexpected crashes so it never silently dies.
+    CYCLE_INTERVAL_SECONDS. Wrapped in hard timeouts and exception guards so it
+    never silently dies or hangs.
     """
+    global last_cycle_started_at, last_cycle_finished_at
     logger.info(
         "Background ingestion loop started. Cycle interval: %ds.",
         CYCLE_INTERVAL_SECONDS,
     )
+    hard_timeout = getattr(settings, "cycle_hard_timeout_seconds", 600.0)
+
     while True:
+        cycle_start_time = time.monotonic()
+        last_cycle_started_at = datetime.now(timezone.utc)
+        logger.info("Cycle started.")
+
         try:
-            await run_cycle()
+            await asyncio.wait_for(run_cycle(), timeout=hard_timeout)
+            duration = time.monotonic() - cycle_start_time
+            last_cycle_finished_at = datetime.now(timezone.utc)
+            logger.info("Cycle finished in %.2fs.", duration)
+        except asyncio.TimeoutError:
+            duration = time.monotonic() - cycle_start_time
+            logger.error("Cycle hard timeout - cancelled after %.2fs.", duration)
         except Exception as exc:
-            # Should not reach here (run_cycle handles its own errors), but
-            # just in case — log and continue rather than crashing the loop.
-            logger.exception("Unexpected error in background loop: %s", exc)
+            duration = time.monotonic() - cycle_start_time
+            logger.exception("Cycle failed after %.2fs: %s", duration, exc)
 
         # Evaluate alert rules for all trackers with active rules, regardless
         # of whether new posts arrived in this cycle.
-        await _run_scheduled_alerts()
+        try:
+            await _run_scheduled_alerts()
+        except Exception as exc:
+            logger.exception("Scheduled alert evaluation error: %s", exc)
 
         logger.info("Background loop sleeping for %ds.", CYCLE_INTERVAL_SECONDS)
         await asyncio.sleep(CYCLE_INTERVAL_SECONDS)
@@ -142,6 +187,8 @@ async def _background_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    global _loop_task, _is_shutting_down
+    _is_shutting_down = False
     logger.info("Argus backend starting up.")
 
     # ── Pre-warm the NLP dictionary in a worker thread ──────────────────────
@@ -156,16 +203,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as _dict_exc:
         logger.warning("NLP dictionary pre-warm failed (non-fatal): %s", _dict_exc)
 
-    loop_task = asyncio.create_task(_background_loop())
+    _loop_task = asyncio.create_task(_background_loop())
+    _loop_task.add_done_callback(_on_loop_task_done)
     try:
         yield  # server is running; handle requests here
     finally:
         logger.info("Argus backend shutting down.")
-        loop_task.cancel()
-        try:
-            await loop_task
-        except asyncio.CancelledError:
-            pass
+        _is_shutting_down = True
+        if _loop_task:
+            _loop_task.cancel()
+            try:
+                await _loop_task
+            except asyncio.CancelledError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +235,40 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["ops"])
-async def health() -> dict[str, str]:
+async def health() -> JSONResponse:
     """
-    Liveness probe. Returns 200 OK as long as the process is running.
-    Used by Fly.io health checks and Docker HEALTHCHECK.
+    Liveness probe and ingestion freshness watchdog (zero I/O).
+    Returns 200 OK during startup grace period (15m) or if cycles are running.
+    Returns 503 Service Unavailable if no cycle has finished within health_stale_minutes.
     """
-    return {"status": "ok"}
+    now = datetime.now(timezone.utc)
+    uptime_seconds = (now - app_booted_at).total_seconds()
+
+    seconds_since_last_cycle: float | None = None
+    if last_cycle_finished_at is not None:
+        seconds_since_last_cycle = round((now - last_cycle_finished_at).total_seconds(), 2)
+
+    stale_threshold_seconds = getattr(settings, "health_stale_minutes", 20) * 60.0
+    startup_grace_seconds = 15.0 * 60.0  # 15-minute startup grace period
+
+    is_stale = False
+    if uptime_seconds > startup_grace_seconds:
+        if last_cycle_finished_at is None or (seconds_since_last_cycle is not None and seconds_since_last_cycle > stale_threshold_seconds):
+            is_stale = True
+
+    status_code = 503 if is_stale else 200
+    status_str = "stale" if is_stale else "ok"
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": status_str,
+            "uptime_seconds": round(uptime_seconds, 2),
+            "last_cycle_started_at": last_cycle_started_at.isoformat() if last_cycle_started_at else None,
+            "last_cycle_finished_at": last_cycle_finished_at.isoformat() if last_cycle_finished_at else None,
+            "seconds_since_last_cycle": seconds_since_last_cycle,
+        },
+    )
 
 
 @app.post("/run-cycle", tags=["ops"])
