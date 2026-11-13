@@ -124,9 +124,12 @@ Posts to classify:
 
 
 def _extract_json(raw: str) -> Any:
-    """Extract and parse JSON from raw model output, stripping markdown code fences."""
+    """Extract and parse JSON from raw model output, stripping markdown code fences and tolerating unescaped control characters."""
     cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
-    return json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return json.loads(cleaned, strict=False)
 
 
 def _validate_and_sanitize(item: dict[str, Any]) -> SentimentResult:

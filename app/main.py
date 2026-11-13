@@ -234,13 +234,8 @@ app = FastAPI(
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.get("/health", tags=["ops"])
-async def health() -> JSONResponse:
-    """
-    Liveness probe and ingestion freshness watchdog (zero I/O).
-    Returns 200 OK during startup grace period (15m) or if cycles are running.
-    Returns 503 Service Unavailable if no cycle has finished within health_stale_minutes.
-    """
+def _compute_health_data() -> tuple[dict[str, Any], bool]:
+    """Helper to compute watchdog status without performing any I/O."""
     now = datetime.now(timezone.utc)
     uptime_seconds = (now - app_booted_at).total_seconds()
 
@@ -253,22 +248,43 @@ async def health() -> JSONResponse:
 
     is_stale = False
     if uptime_seconds > startup_grace_seconds:
-        if last_cycle_finished_at is None or (seconds_since_last_cycle is not None and seconds_since_last_cycle > stale_threshold_seconds):
+        if last_cycle_finished_at is None or (
+            seconds_since_last_cycle is not None and seconds_since_last_cycle > stale_threshold_seconds
+        ):
             is_stale = True
 
-    status_code = 503 if is_stale else 200
-    status_str = "stale" if is_stale else "ok"
+    data = {
+        "status": "stale" if is_stale else "ok",
+        "stale": is_stale,
+        "uptime_seconds": round(uptime_seconds, 2),
+        "last_cycle_started_at": last_cycle_started_at.isoformat() if last_cycle_started_at else None,
+        "last_cycle_finished_at": last_cycle_finished_at.isoformat() if last_cycle_finished_at else None,
+        "seconds_since_last_cycle": seconds_since_last_cycle,
+    }
+    return data, is_stale
 
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": status_str,
-            "uptime_seconds": round(uptime_seconds, 2),
-            "last_cycle_started_at": last_cycle_started_at.isoformat() if last_cycle_started_at else None,
-            "last_cycle_finished_at": last_cycle_finished_at.isoformat() if last_cycle_finished_at else None,
-            "seconds_since_last_cycle": seconds_since_last_cycle,
-        },
-    )
+
+@app.get("/health", tags=["ops"])
+async def health() -> JSONResponse:
+    """
+    Keep-alive and liveness probe (zero I/O).
+    ALWAYS returns HTTP 200 so external pingers (like cron-job.org or basic uptime checks)
+    never disable their jobs due to 503 responses, while still reporting the 'stale' boolean.
+    """
+    data, _ = _compute_health_data()
+    return JSONResponse(status_code=200, content=data)
+
+
+@app.get("/health/deep", tags=["ops"])
+async def health_deep() -> JSONResponse:
+    """
+    Deep health check / watchdog probe (zero I/O).
+    Returns 200 OK during startup grace period (15m) or if cycles are running normally.
+    Returns 503 Service Unavailable if no cycle has completed within health_stale_minutes.
+    """
+    data, is_stale = _compute_health_data()
+    status_code = 503 if is_stale else 200
+    return JSONResponse(status_code=status_code, content=data)
 
 
 @app.post("/run-cycle", tags=["ops"])

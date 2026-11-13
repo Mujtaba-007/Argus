@@ -31,6 +31,24 @@ _cycle_lock = asyncio.Lock()
 # Trends run at most once every 30 minutes per tracker (in-memory throttle)
 TRENDS_THROTTLE_SECONDS = 30 * 60
 _last_trends_run: dict[str, datetime] = {}
+_cycle_counter: int = 0
+
+
+def _extract_newest_posted_at(messages: list[dict[str, Any]]) -> datetime | None:
+    """Find the newest message timestamp among messages."""
+    newest: datetime | None = None
+    for m in messages:
+        raw_ts = m.get("posted_at")
+        if raw_ts:
+            try:
+                dt = datetime.fromisoformat(raw_ts)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if newest is None or dt > newest:
+                    newest = dt
+            except Exception:
+                pass
+    return newest
 
 
 async def run_cycle() -> dict[str, Any]:
@@ -44,6 +62,7 @@ async def run_cycle() -> dict[str, Any]:
 
 
 async def _execute_cycle() -> dict[str, Any]:
+    global _cycle_counter
     t_cycle_start = time.monotonic()
     t_sentiment_start: float | None = None
     sentiments_analyzed_this_cycle = 0
@@ -70,6 +89,14 @@ async def _execute_cycle() -> dict[str, Any]:
     if not trackers:
         logger.info("No active Telegram trackers found.")
         return summary
+
+    # Fairness: rotate tracker order so a single heavy tracker cannot starve others
+    num_active = len(trackers)
+    if num_active > 0:
+        start_idx = _cycle_counter % num_active
+        trackers = trackers[start_idx:] + trackers[:start_idx]
+        _cycle_counter += 1
+        logger.info("Tracker rotation: start_idx=%d/%d.", start_idx, num_active)
 
     if len(trackers) > 15:
         logger.warning(
@@ -142,13 +169,17 @@ async def _execute_cycle() -> dict[str, Any]:
             continue
 
         if not messages:
-            _safe_update_sync_time(tracker_id, summary)
+            await _safe_update_sync_time(tracker_id, summary)
+            logger.info(
+                "Tracker %s ('%s') cycle summary: fetched=0, already_existing=0, new=0, inserted=0, duplicates_ignored=0, sentiment_analyzed=0, deferred=0.",
+                tracker_id, tracker.get("query", tracker_id),
+            )
             continue
 
-        # 1. Deduplicate in ONE batched 'in' query
+        # 1. Deduplicate in batched chunks
         all_ext_ids = [m["external_id"] for m in messages]
         try:
-            existing_ids = get_existing_external_ids(tracker_id, all_ext_ids)
+            existing_ids = await asyncio.to_thread(get_existing_external_ids, tracker_id, all_ext_ids)
             new_messages = [m for m in messages if m["external_id"] not in existing_ids]
         except Exception as exc:
             msg = f"Tracker {tracker_id}: deduplication query failed — {exc}"
@@ -159,12 +190,18 @@ async def _execute_cycle() -> dict[str, Any]:
         total_new = len(new_messages)
         if total_new == 0:
             logger.info("Tracker %s: all messages already exist.", tracker_id)
-            _safe_update_sync_time(tracker_id, summary)
+            newest_dt = _extract_newest_posted_at(messages)
+            await _safe_update_sync_time(tracker_id, summary, newest_dt)
+            logger.info(
+                "Tracker %s ('%s') cycle summary: fetched=%d, already_existing=%d, new=0, inserted=0, duplicates_ignored=0, sentiment_analyzed=0, deferred=0.",
+                tracker_id, tracker.get("query", tracker_id), len(messages), len(existing_ids),
+            )
             continue
 
         # 2. Batch sentiment analysis & batched DB insertions
         tracker_posts_added = 0
         tracker_sentiment_count = 0
+        tracker_had_real_failure = False
         tracker_ingest_budget = min(
             fair_ingest_budget_per_tracker,
             max_sentiment_per_cycle - sentiments_analyzed_this_cycle,
@@ -206,36 +243,50 @@ async def _execute_cycle() -> dict[str, Any]:
                 sentiments = await analyze_batch_async([m["body"] for m in batch])
 
             try:
-                inserted_posts = insert_posts_batch(batch)
+                inserted_posts = await asyncio.to_thread(insert_posts_batch, batch)
             except Exception as exc:
                 msg = f"Tracker {tracker_id}: insert_posts_batch failed — {exc}"
                 logger.error(msg)
                 summary["errors"].append(msg)
+                tracker_had_real_failure = True
                 continue
 
             tracker_posts_added += len(inserted_posts)
             summary["posts_added"] += len(inserted_posts)
 
-            # Insert sentiments only if Gemini batch succeeded
+            # Insert sentiments only if Gemini batch succeeded (mapped strictly by external_id)
             if sentiments is not None:
-                sentiment_rows = [
-                    {
-                        "post_id": post_row["id"],
-                        "tracker_id": tracker_id,
-                        "polarity": sent["polarity"],
-                        "emotion": sent["emotion"],
-                        "confidence": sent["confidence"],
-                    }
-                    for post_row, sent in zip(inserted_posts, sentiments)
-                ]
-                try:
-                    insert_sentiments_batch(sentiment_rows)
-                    sentiments_analyzed_this_cycle += len(batch)
-                    tracker_sentiment_count += len(batch)
-                    summary["sentiments_added"] += len(sentiment_rows)
-                except Exception as exc:
-                    logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
-                logger.info("Tracker %s: batch %d/%d ok.", tracker_id, batch_num, total_batches)
+                sentiment_by_ext_id = {
+                    m["external_id"]: sent
+                    for m, sent in zip(batch, sentiments)
+                    if "external_id" in m
+                }
+                sentiment_rows = []
+                for post_row in inserted_posts:
+                    ext_id = post_row.get("external_id")
+                    sent = sentiment_by_ext_id.get(ext_id)
+                    if sent is not None:
+                        sentiment_rows.append({
+                            "post_id": post_row["id"],
+                            "tracker_id": tracker_id,
+                            "polarity": sent["polarity"],
+                            "emotion": sent["emotion"],
+                            "confidence": sent["confidence"],
+                        })
+
+                if sentiment_rows:
+                    try:
+                        await asyncio.to_thread(insert_sentiments_batch, sentiment_rows)
+                        sentiments_analyzed_this_cycle += len(sentiment_rows)
+                        tracker_sentiment_count += len(sentiment_rows)
+                        summary["sentiments_added"] += len(sentiment_rows)
+                    except Exception as exc:
+                        logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
+                        tracker_had_real_failure = True
+                logger.info(
+                    "Tracker %s: batch %d/%d ok (inserted %d, sentiments %d).",
+                    tracker_id, batch_num, total_batches, len(inserted_posts), len(sentiment_rows)
+                )
             else:
                 if not can_analyze:
                     logger.info(
@@ -248,14 +299,38 @@ async def _execute_cycle() -> dict[str, Any]:
                         tracker_id, batch_num, total_batches, len(inserted_posts),
                     )
 
-            # Insert interactions for replies and forwards
-            _record_interactions(tracker_id, batch, inserted_posts)
+            # Insert interactions for replies and forwards mapped by external_id
+            await _record_interactions(tracker_id, batch, inserted_posts)
 
             logger.info("Tracker %s: processed %d/%d posts.", tracker_id, min(i + batch_size, total_new), total_new)
 
+        duplicates_ignored = max(0, total_new - tracker_posts_added)
+        deferred_count = max(0, tracker_posts_added - tracker_sentiment_count)
         tracker_ingest_counts[tracker_id] = tracker_sentiment_count
-        tracker_deferred_ingest[tracker_id] = max(0, total_new - tracker_sentiment_count)
-        _safe_update_sync_time(tracker_id, summary)
+        tracker_deferred_ingest[tracker_id] = deferred_count
+
+        # Advance last_sync_at only if all batches finished without real errors
+        if tracker_had_real_failure:
+            logger.warning(
+                "Tracker %s: encountered real batch errors. last_sync_at will NOT be advanced.",
+                tracker_id,
+            )
+        else:
+            newest_dt = _extract_newest_posted_at(messages)
+            await _safe_update_sync_time(tracker_id, summary, newest_dt)
+
+        logger.info(
+            "Tracker %s ('%s') cycle summary: fetched=%d, already_existing=%d, new=%d, inserted=%d, duplicates_ignored=%d, sentiment_analyzed=%d, deferred=%d.",
+            tracker_id,
+            tracker.get("query", tracker_id),
+            len(messages),
+            len(existing_ids),
+            total_new,
+            tracker_posts_added,
+            duplicates_ignored,
+            tracker_sentiment_count,
+            deferred_count,
+        )
 
         # 3. Trigger TRENDS analytics — at most once every 30 min per tracker.
         #    (Sentiment and network/alert analytics keep their own schedule.)
@@ -420,18 +495,30 @@ async def _execute_cycle() -> dict[str, Any]:
     return summary
 
 
-def _record_interactions(tracker_id: str, batch: list[dict], inserted_posts: list[dict]) -> None:
-    """Build and write interaction rows for replies and forwards."""
+async def _record_interactions(tracker_id: str, batch: list[dict], inserted_posts: list[dict]) -> None:
+    """Build and write interaction rows for replies and forwards mapped by external_id."""
     reply_ext_ids = [p["reply_to_external_id"] for p in batch if p.get("reply_to_external_id")]
-    target_authors = get_post_authors_by_external_ids(tracker_id, reply_ext_ids) if reply_ext_ids else {}
+    target_authors = (
+        await asyncio.to_thread(get_post_authors_by_external_ids, tracker_id, reply_ext_ids)
+        if reply_ext_ids
+        else {}
+    )
     for p in batch:
         ext_id = p.get("external_id")
         a_hash = p.get("author_hash")
         if ext_id and a_hash and ext_id not in target_authors:
             target_authors[ext_id] = a_hash
 
+    # Map inserted posts by external_id to avoid list index misalignment
+    inserted_by_ext_id = {p["external_id"]: p for p in inserted_posts if "external_id" in p}
+
     interactions = []
-    for raw_p, ins_p in zip(batch, inserted_posts):
+    for raw_p in batch:
+        ext_id = raw_p.get("external_id")
+        ins_p = inserted_by_ext_id.get(ext_id)
+        if not ins_p:
+            continue  # Post was not newly inserted (e.g. duplicate ignored)
+
         src_hash = raw_p.get("author_hash")
         reply_to = raw_p.get("reply_to_external_id")
         fwd_hash = raw_p.get("forwarded_from_hash")
@@ -451,14 +538,19 @@ def _record_interactions(tracker_id: str, batch: list[dict], inserted_posts: lis
 
     if interactions:
         try:
-            insert_interactions_batch(interactions)
+            await asyncio.to_thread(insert_interactions_batch, interactions)
         except Exception as exc:
             logger.warning("Tracker %s: insert_interactions_batch failed — %s", tracker_id, exc)
 
 
-def _safe_update_sync_time(tracker_id: str, summary: dict[str, Any]) -> None:
+async def _safe_update_sync_time(
+    tracker_id: str,
+    summary: dict[str, Any],
+    synced_at: datetime | None = None,
+) -> None:
+    target_dt = synced_at or datetime.now(tz=timezone.utc)
     try:
-        update_tracker_last_sync(tracker_id, datetime.now(tz=timezone.utc))
+        await asyncio.to_thread(update_tracker_last_sync, tracker_id, target_dt)
     except Exception as exc:
         msg = f"Tracker {tracker_id}: failed to update last_sync_at — {exc}"
         logger.error(msg)
@@ -508,13 +600,13 @@ async def sync_single_x_tracker(tracker: dict[str, Any]) -> dict[str, Any]:
         }
 
     if not messages:
-        _safe_update_sync_time(tracker_id, summary)
+        await _safe_update_sync_time(tracker_id, summary)
         return {"status": "ok", "message": "No new posts found", "posts_added": 0, "sentiments_added": 0}
 
-    # Deduplicate
+    # Deduplicate in batched chunks
     all_ext_ids = [m["external_id"] for m in messages]
     try:
-        existing_ids = get_existing_external_ids(tracker_id, all_ext_ids)
+        existing_ids = await asyncio.to_thread(get_existing_external_ids, tracker_id, all_ext_ids)
         new_messages = [m for m in messages if m["external_id"] not in existing_ids]
     except Exception as exc:
         msg = f"Tracker {tracker_id} deduplication query failed: {exc}"
@@ -523,13 +615,15 @@ async def sync_single_x_tracker(tracker: dict[str, Any]) -> dict[str, Any]:
 
     total_new = len(new_messages)
     if total_new == 0:
-        _safe_update_sync_time(tracker_id, summary)
+        newest_dt = _extract_newest_posted_at(messages)
+        await _safe_update_sync_time(tracker_id, summary, newest_dt)
         return {"status": "ok", "message": "All posts already exist", "posts_added": 0, "sentiments_added": 0}
 
     # Process batches
     batch_size = settings.gemini_batch_size
     tracker_posts_added = 0
     sentiments_analyzed = 0
+    tracker_had_real_failure = False
     max_sentiment_per_cycle = getattr(settings, "max_sentiment_per_cycle", 300)
     sentiment_timeout_seconds = getattr(settings, "cycle_sentiment_timeout_seconds", 90.0)
     t_start = time.monotonic()
@@ -546,37 +640,51 @@ async def sync_single_x_tracker(tracker: dict[str, Any]) -> dict[str, Any]:
         sentiments = await analyze_batch_async([m["body"] for m in batch]) if can_analyze else None
 
         try:
-            inserted_posts = insert_posts_batch(batch)
+            inserted_posts = await asyncio.to_thread(insert_posts_batch, batch)
         except Exception as exc:
             msg = f"Tracker {tracker_id}: insert_posts_batch failed — {exc}"
             logger.error(msg)
             summary["errors"].append(msg)
+            tracker_had_real_failure = True
             continue
 
         tracker_posts_added += len(inserted_posts)
         summary["posts_added"] += len(inserted_posts)
 
         if sentiments is not None:
-            sentiment_rows = [
-                {
-                    "post_id": post_row["id"],
-                    "tracker_id": tracker_id,
-                    "polarity": sent["polarity"],
-                    "emotion": sent["emotion"],
-                    "confidence": sent["confidence"],
-                }
-                for post_row, sent in zip(inserted_posts, sentiments)
-            ]
-            try:
-                insert_sentiments_batch(sentiment_rows)
-                sentiments_analyzed += len(batch)
-                summary["sentiments_added"] += len(sentiment_rows)
-            except Exception as exc:
-                logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
+            sentiment_by_ext_id = {
+                m["external_id"]: sent
+                for m, sent in zip(batch, sentiments)
+                if "external_id" in m
+            }
+            sentiment_rows = []
+            for post_row in inserted_posts:
+                ext_id = post_row.get("external_id")
+                sent = sentiment_by_ext_id.get(ext_id)
+                if sent is not None:
+                    sentiment_rows.append({
+                        "post_id": post_row["id"],
+                        "tracker_id": tracker_id,
+                        "polarity": sent["polarity"],
+                        "emotion": sent["emotion"],
+                        "confidence": sent["confidence"],
+                    })
+            if sentiment_rows:
+                try:
+                    await asyncio.to_thread(insert_sentiments_batch, sentiment_rows)
+                    sentiments_analyzed += len(sentiment_rows)
+                    summary["sentiments_added"] += len(sentiment_rows)
+                except Exception as exc:
+                    logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
+                    tracker_had_real_failure = True
 
-        _record_interactions(tracker_id, batch, inserted_posts)
+        await _record_interactions(tracker_id, batch, inserted_posts)
 
-    _safe_update_sync_time(tracker_id, summary)
+    if not tracker_had_real_failure:
+        newest_dt = _extract_newest_posted_at(messages)
+        await _safe_update_sync_time(tracker_id, summary, newest_dt)
+    else:
+        logger.warning("Tracker %s manual sync: encountered batch errors, last_sync_at not advanced.", tracker_id)
 
     if tracker_posts_added > 0:
         try:

@@ -5,12 +5,42 @@
 import logging
 from datetime import datetime, timezone
 from typing import Any
-from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
+from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log, retry_if_exception
 from app.db.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """Return True if the exception is transient (network drop, timeout, 5xx) and safe to retry.
+    Returns False for client errors (4xx), duplicate keys (23505 / 409), invalid queries, etc.
+    """
+    # Check PostgREST APIError code or Postgres error class
+    code = getattr(exc, "code", None)
+    if code is not None:
+        code_str = str(code).strip()
+        # Postgres error classes: 22 (data exception), 23 (integrity constraint violation e.g. 23505),
+        # 42 (syntax error / access rule violation)
+        if code_str.startswith(("22", "23", "42")):
+            return False
+        # HTTP 4xx client errors
+        if code_str.isdigit() and 400 <= int(code_str) < 500:
+            return False
+
+    exc_str = str(exc)
+    if "23505" in exc_str or "duplicate key" in exc_str:
+        return False
+
+    # Check for httpx HTTPStatusError status_code
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code is not None and 400 <= status_code < 500:
+        return False
+
+    return True
+
+
 _db_retry = retry(
+    retry=retry_if_exception(_is_transient_db_error),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=8),
     before_sleep=before_sleep_log(logger, logging.WARNING),
@@ -67,17 +97,24 @@ def post_exists(tracker_id: str, external_id: str) -> bool:
 
 @_db_retry
 def get_existing_external_ids(tracker_id: str, external_ids: list[str]) -> set[str]:
-    """Fetch existing external_ids in a single batched 'in' query."""
+    """Fetch existing external_ids in chunks of at most 200 to prevent PostgREST row caps and URL length issues."""
     if not external_ids:
         return set()
-    result = (
-        supabase.table("posts")
-        .select("external_id")
-        .eq("tracker_id", tracker_id)
-        .in_("external_id", external_ids)
-        .execute()
-    )
-    return {r["external_id"] for r in (result.data or []) if "external_id" in r}
+    chunk_size = 200
+    existing: set[str] = set()
+    for i in range(0, len(external_ids), chunk_size):
+        chunk = external_ids[i : i + chunk_size]
+        result = (
+            supabase.table("posts")
+            .select("external_id")
+            .eq("tracker_id", tracker_id)
+            .in_("external_id", chunk)
+            .execute()
+        )
+        for r in (result.data or []):
+            if "external_id" in r:
+                existing.add(r["external_id"])
+    return existing
 
 
 @_db_retry
@@ -89,10 +126,18 @@ def insert_post(post: dict[str, Any]) -> str:
 
 @_db_retry
 def insert_posts_batch(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Insert multiple posts in a single roundtrip, returning created rows."""
+    """Upsert multiple posts in a single roundtrip, ignoring duplicate (tracker_id, external_id) rows."""
     if not posts:
         return []
-    result = supabase.table("posts").insert(posts).execute()
+    result = (
+        supabase.table("posts")
+        .upsert(
+            posts,
+            on_conflict="tracker_id,external_id",
+            ignore_duplicates=True,
+        )
+        .execute()
+    )
     return result.data or []
 
 
@@ -112,21 +157,24 @@ def insert_sentiments_batch(sentiments: list[dict[str, Any]]) -> None:
 
 @_db_retry
 def get_post_authors_by_external_ids(tracker_id: str, external_ids: list[str]) -> dict[str, str]:
-    """Return mapping of external_id -> author_hash for replied-to post author lookups."""
+    """Return mapping of external_id -> author_hash for replied-to post author lookups in chunks of 200."""
     if not external_ids:
         return {}
-    result = (
-        supabase.table("posts")
-        .select("external_id, author_hash")
-        .eq("tracker_id", tracker_id)
-        .in_("external_id", external_ids)
-        .execute()
-    )
-    return {
-        r["external_id"]: r["author_hash"]
-        for r in (result.data or [])
-        if r.get("external_id") and r.get("author_hash")
-    }
+    chunk_size = 200
+    authors: dict[str, str] = {}
+    for i in range(0, len(external_ids), chunk_size):
+        chunk = external_ids[i : i + chunk_size]
+        result = (
+            supabase.table("posts")
+            .select("external_id, author_hash")
+            .eq("tracker_id", tracker_id)
+            .in_("external_id", chunk)
+            .execute()
+        )
+        for r in (result.data or []):
+            if r.get("external_id") and r.get("author_hash"):
+                authors[r["external_id"]] = r["author_hash"]
+    return authors
 
 
 @_db_retry
