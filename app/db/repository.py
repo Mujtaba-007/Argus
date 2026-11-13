@@ -286,3 +286,84 @@ def upsert_sentiments_batch(sentiments: list[dict[str, Any]]) -> None:
         return
     supabase.table("sentiments").upsert(sentiments).execute()
 
+
+@_db_retry
+def get_posts_needing_sentiment_windowed(
+    tracker_id: str,
+    limit: int = 200,
+    days: int = 7,
+) -> list[dict[str, Any]]:
+    """Efficiently return up to `limit` posts from the last `days` days that have
+    no valid sentiment row, newest first.
+
+    Uses two bounded, date-filtered queries rather than a full table scan, so it
+    never causes a Supabase statement timeout even with thousands of stored posts.
+
+    A 'valid' sentiment is any row that is NOT (confidence==0 AND emotion in
+    {neutral, unclassified}).  Posts without any sentiment row are always returned.
+    """
+    from datetime import timedelta
+    since_dt = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # 1. Posts from the last N days, newest first, bounded by 1000 (safe range)
+    res_posts = (
+        supabase.table("posts")
+        .select("id, tracker_id, body, posted_at")
+        .eq("tracker_id", tracker_id)
+        .gte("posted_at", since_dt)
+        .order("posted_at", desc=True)
+        .limit(1000)
+        .execute()
+    )
+    recent_posts = res_posts.data or []
+    if not recent_posts:
+        return []
+
+    post_ids = [p["id"] for p in recent_posts]
+
+    # 2. Sentiments for only those post IDs (chunked to stay under URL length)
+    chunk_size = 200
+    sent_map: dict[str, dict] = {}
+    for i in range(0, len(post_ids), chunk_size):
+        chunk = post_ids[i : i + chunk_size]
+        res_sent = (
+            supabase.table("sentiments")
+            .select("post_id, emotion, confidence")
+            .in_("post_id", chunk)
+            .execute()
+        )
+        for s in (res_sent.data or []):
+            sent_map[s["post_id"]] = s
+
+    # 3. Filter to posts lacking valid sentiment
+    candidates: list[dict[str, Any]] = []
+    bad_post_ids: list[str] = []
+    for post in recent_posts:
+        pid = post["id"]
+        sent = sent_map.get(pid)
+        if sent is None:
+            candidates.append(post)
+        elif (
+            sent.get("confidence", 0.0) == 0.0
+            and str(sent.get("emotion", "")).lower() in {"neutral", "unclassified"}
+        ):
+            candidates.append(post)
+            bad_post_ids.append(pid)
+        if len(candidates) >= limit:
+            break
+
+    # 4. Delete stale bad-sentiment rows so upsert inserts cleanly
+    if bad_post_ids:
+        try:
+            for i in range(0, len(bad_post_ids), 100):
+                chunk = bad_post_ids[i : i + 100]
+                supabase.table("sentiments").delete().eq("tracker_id", tracker_id).in_("post_id", chunk).execute()
+        except Exception as exc:
+            logger.warning("Tracker %s: failed to delete stale sentiment rows — %s", tracker_id, exc)
+
+    logger.info(
+        "Tracker %s: windowed backfill found %d posts needing sentiment (last %dd, %d recent posts scanned).",
+        tracker_id, len(candidates), days, len(recent_posts),
+    )
+    return candidates
+

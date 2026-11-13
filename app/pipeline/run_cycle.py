@@ -15,6 +15,7 @@ from app.db.repository import (
     get_existing_external_ids,
     get_post_authors_by_external_ids,
     get_posts_needing_sentiment,
+    get_posts_needing_sentiment_windowed,
     insert_interactions_batch,
     insert_posts_batch,
     insert_sentiments_batch,
@@ -23,6 +24,7 @@ from app.db.repository import (
 )
 from app.ingestion.telegram_worker import fetch_new_messages
 from app.ingestion.x_worker import fetch_new_posts
+from app.nlp.gemini_client import gemini_cooldown_minutes_remaining
 from app.nlp.sentiment import analyze_batch_async
 
 logger = logging.getLogger(__name__)
@@ -198,7 +200,7 @@ async def _execute_cycle() -> dict[str, Any]:
             )
             continue
 
-        # 2. Batch sentiment analysis & batched DB insertions
+        # 2. Batch insertions first, then sentiment on actually-inserted rows
         tracker_posts_added = 0
         tracker_sentiment_count = 0
         tracker_had_real_failure = False
@@ -215,33 +217,7 @@ async def _execute_cycle() -> dict[str, Any]:
             batch_num += 1
             batch = new_messages[i : i + batch_size]
 
-            # Enforce per-tracker ingest budget, global cycle cap, and hard time guard
-            can_analyze = True
-            if sentiments_analyzed_this_cycle >= max_sentiment_per_cycle:
-                can_analyze = False
-                logger.info(
-                    "Tracker %s: per-cycle sentiment cap reached (%d/%d posts). Ingesting batch %d/%d without sentiment (deferred to backfill).",
-                    tracker_id, sentiments_analyzed_this_cycle, max_sentiment_per_cycle, batch_num, total_batches,
-                )
-            elif tracker_sentiment_count >= tracker_ingest_budget:
-                can_analyze = False
-                logger.info(
-                    "Tracker %s: per-tracker ingest sentiment budget reached (%d/%d posts). Ingesting batch %d/%d without sentiment (deferred to backfill).",
-                    tracker_id, tracker_sentiment_count, tracker_ingest_budget, batch_num, total_batches,
-                )
-            elif t_sentiment_start is not None and (time.monotonic() - t_sentiment_start) >= sentiment_timeout_seconds:
-                can_analyze = False
-                logger.warning(
-                    "Tracker %s: cycle sentiment time guard triggered (%.1fs elapsed >= %.1fs). Deferring batch %d/%d to backfill.",
-                    tracker_id, time.monotonic() - t_sentiment_start, sentiment_timeout_seconds, batch_num, total_batches,
-                )
-
-            sentiments = None
-            if can_analyze:
-                if t_sentiment_start is None:
-                    t_sentiment_start = time.monotonic()
-                sentiments = await analyze_batch_async([m["body"] for m in batch])
-
+            # --- Insert first, classify only what actually landed ---
             try:
                 inserted_posts = await asyncio.to_thread(insert_posts_batch, batch)
             except Exception as exc:
@@ -254,50 +230,81 @@ async def _execute_cycle() -> dict[str, Any]:
             tracker_posts_added += len(inserted_posts)
             summary["posts_added"] += len(inserted_posts)
 
-            # Insert sentiments only if Gemini batch succeeded (mapped strictly by external_id)
-            if sentiments is not None:
-                sentiment_by_ext_id = {
-                    m["external_id"]: sent
-                    for m, sent in zip(batch, sentiments)
-                    if "external_id" in m
-                }
-                sentiment_rows = []
-                for post_row in inserted_posts:
-                    ext_id = post_row.get("external_id")
-                    sent = sentiment_by_ext_id.get(ext_id)
-                    if sent is not None:
-                        sentiment_rows.append({
-                            "post_id": post_row["id"],
-                            "tracker_id": tracker_id,
-                            "polarity": sent["polarity"],
-                            "emotion": sent["emotion"],
-                            "confidence": sent["confidence"],
-                        })
+            if not inserted_posts:
+                # All in this mini-batch were duplicate-ignored; skip Gemini
+                await _record_interactions(tracker_id, batch, inserted_posts)
+                continue
 
-                if sentiment_rows:
-                    try:
-                        await asyncio.to_thread(insert_sentiments_batch, sentiment_rows)
-                        sentiments_analyzed_this_cycle += len(sentiment_rows)
-                        tracker_sentiment_count += len(sentiment_rows)
-                        summary["sentiments_added"] += len(sentiment_rows)
-                    except Exception as exc:
-                        logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
-                        tracker_had_real_failure = True
+            # Decide whether to run Gemini on this batch
+            can_analyze = True
+            if gemini_cooldown_minutes_remaining() > 0:
+                can_analyze = False
+                # Logged once per cycle at cycle-summary level; skip per-batch noise
+            elif sentiments_analyzed_this_cycle >= max_sentiment_per_cycle:
+                can_analyze = False
                 logger.info(
-                    "Tracker %s: batch %d/%d ok (inserted %d, sentiments %d).",
-                    tracker_id, batch_num, total_batches, len(inserted_posts), len(sentiment_rows)
+                    "Tracker %s: per-cycle sentiment cap reached (%d/%d). Batch %d/%d deferred.",
+                    tracker_id, sentiments_analyzed_this_cycle, max_sentiment_per_cycle, batch_num, total_batches,
                 )
+            elif tracker_sentiment_count >= tracker_ingest_budget:
+                can_analyze = False
+                logger.info(
+                    "Tracker %s: per-tracker budget reached (%d/%d). Batch %d/%d deferred.",
+                    tracker_id, tracker_sentiment_count, tracker_ingest_budget, batch_num, total_batches,
+                )
+            elif t_sentiment_start is not None and (time.monotonic() - t_sentiment_start) >= sentiment_timeout_seconds:
+                can_analyze = False
+                logger.warning(
+                    "Tracker %s: 90s time guard reached (%.1fs). Batch %d/%d deferred.",
+                    tracker_id, time.monotonic() - t_sentiment_start, batch_num, total_batches,
+                )
+
+            sentiments = None
+            if can_analyze:
+                if t_sentiment_start is None:
+                    t_sentiment_start = time.monotonic()
+                # Only classify the bodies of rows that were actually inserted
+                inserted_by_ext_id = {p["external_id"]: p for p in inserted_posts if "external_id" in p}
+                texts_to_classify = [inserted_by_ext_id[m["external_id"]].get("body") or m["body"]
+                                     for m in batch if m.get("external_id") in inserted_by_ext_id]
+                posts_to_classify = [inserted_by_ext_id[m["external_id"]]
+                                     for m in batch if m.get("external_id") in inserted_by_ext_id]
+                if texts_to_classify:
+                    sentiments = await analyze_batch_async(texts_to_classify)
+                    if sentiments is not None:
+                        sentiment_rows = [
+                            {
+                                "post_id": post_row["id"],
+                                "tracker_id": tracker_id,
+                                "polarity": sent["polarity"],
+                                "emotion": sent["emotion"],
+                                "confidence": sent["confidence"],
+                            }
+                            for post_row, sent in zip(posts_to_classify, sentiments)
+                        ]
+                        if sentiment_rows:
+                            try:
+                                await asyncio.to_thread(insert_sentiments_batch, sentiment_rows)
+                                sentiments_analyzed_this_cycle += len(sentiment_rows)
+                                tracker_sentiment_count += len(sentiment_rows)
+                                summary["sentiments_added"] += len(sentiment_rows)
+                            except Exception as exc:
+                                logger.error("Tracker %s: insert_sentiments_batch failed — %s", tracker_id, exc)
+                                tracker_had_real_failure = True
+                        logger.info(
+                            "Tracker %s: batch %d/%d inserted %d, analyzed %d.",
+                            tracker_id, batch_num, total_batches, len(inserted_posts), len(sentiment_rows),
+                        )
+                    else:
+                        logger.warning(
+                            "Tracker %s: batch %d/%d Gemini failed; %d posts left for backfill.",
+                            tracker_id, batch_num, total_batches, len(inserted_posts),
+                        )
             else:
-                if not can_analyze:
-                    logger.info(
-                        "Tracker %s: batch %d/%d inserted without sentiment (deferred to backfill).",
-                        tracker_id, batch_num, total_batches,
-                    )
-                else:
-                    logger.warning(
-                        "Tracker %s: batch %d/%d failed with Gemini. Skipping sentiment insertion for %d posts.",
-                        tracker_id, batch_num, total_batches, len(inserted_posts),
-                    )
+                logger.info(
+                    "Tracker %s: batch %d/%d inserted %d posts without sentiment (deferred to backfill).",
+                    tracker_id, batch_num, total_batches, len(inserted_posts),
+                )
 
             # Insert interactions for replies and forwards mapped by external_id
             await _record_interactions(tracker_id, batch, inserted_posts)
@@ -364,20 +371,36 @@ async def _execute_cycle() -> dict[str, Any]:
                 logger.error("Tracker %s: network/demographics analytics failed — %s", tracker_id, exc)
 
     # -----------------------------------------------------------------------
-    # Backfill pass: drain deferred posts using remaining budget & time guard
+    # Backfill pass: drain stored-but-unanalyzed posts from last 7 days.
+    # Uses windowed query (no full table scan) and respects the same 90s guard
+    # and cycle budget as the ingestion pass.  Skipped entirely if Gemini is in
+    # its 429 cooldown.
     # -----------------------------------------------------------------------
     tracker_backfill_counts: dict[str, int] = {}
     tracker_still_awaiting: dict[str, int] = {}
 
+    cooldown_mins = gemini_cooldown_minutes_remaining()
     remaining_cycle_budget = max_sentiment_per_cycle - sentiments_analyzed_this_cycle
     time_exhausted = (
         t_sentiment_start is not None
         and (time.monotonic() - t_sentiment_start) >= sentiment_timeout_seconds
     )
 
-    if remaining_cycle_budget > 0 and not time_exhausted:
+    if cooldown_mins > 0:
         logger.info(
-            "Starting backfill pass: %d posts remaining in cycle budget (%.1fs elapsed on sentiment).",
+            "Backfill pass skipped: Gemini is in cooldown for %.1f more minutes.",
+            cooldown_mins,
+        )
+    elif remaining_cycle_budget <= 0:
+        logger.info("Backfill pass skipped: cycle sentiment cap already reached (%d).", max_sentiment_per_cycle)
+    elif time_exhausted:
+        logger.info(
+            "Backfill pass skipped: 90s sentiment time guard already exhausted (%.1fs elapsed).",
+            time.monotonic() - t_sentiment_start if t_sentiment_start else 0.0,
+        )
+    else:
+        logger.info(
+            "Starting backfill pass: %d posts budget remaining, %.1fs elapsed on sentiment.",
             remaining_cycle_budget,
             time.monotonic() - t_sentiment_start if t_sentiment_start else 0.0,
         )
@@ -386,14 +409,18 @@ async def _execute_cycle() -> dict[str, Any]:
             tracker_id = tracker["id"]
 
             if sentiments_analyzed_this_cycle >= max_sentiment_per_cycle:
-                logger.info("Backfill pass: reached cycle sentiment cap (%d posts). Stopping.", max_sentiment_per_cycle)
+                logger.info("Backfill pass: cycle cap reached (%d). Stopping.", max_sentiment_per_cycle)
                 break
 
             if t_sentiment_start is not None and (time.monotonic() - t_sentiment_start) >= sentiment_timeout_seconds:
                 logger.warning(
-                    "Backfill pass: sentiment time guard reached (%.1fs >= %.1fs). Stopping.",
-                    time.monotonic() - t_sentiment_start, sentiment_timeout_seconds,
+                    "Backfill pass: 90s time guard reached (%.1fs). Stopping.",
+                    time.monotonic() - t_sentiment_start,
                 )
+                break
+
+            if gemini_cooldown_minutes_remaining() > 0:
+                logger.info("Backfill pass: Gemini entered cooldown mid-pass. Stopping.")
                 break
 
             # Fair share of remaining budget across remaining trackers
@@ -407,32 +434,35 @@ async def _execute_cycle() -> dict[str, Any]:
 
             try:
                 pending_posts = await asyncio.to_thread(
-                    get_posts_needing_sentiment,
+                    get_posts_needing_sentiment_windowed,
                     tracker_id,
-                    getattr(settings, "max_per_cycle", 1000),
+                    tracker_backfill_budget,  # limit — only fetch what we can process
+                    7,                         # days window
                 )
             except Exception as exc:
-                logger.error("Tracker %s backfill: get_posts_needing_sentiment failed — %s", tracker_id, exc)
+                logger.error("Tracker %s backfill: get_posts_needing_sentiment_windowed failed — %s", tracker_id, exc)
+                tracker_still_awaiting[tracker_id] = -1  # unknown
                 continue
 
             total_pending = len(pending_posts)
+            tracker_backfill_counts[tracker_id] = 0
             if total_pending == 0:
                 tracker_still_awaiting[tracker_id] = 0
-                tracker_backfill_counts[tracker_id] = 0
                 continue
 
-            to_analyze = pending_posts[:tracker_backfill_budget]
             bf_analyzed = 0
             bf_batch_size = settings.gemini_batch_size
 
-            for j in range(0, len(to_analyze), bf_batch_size):
+            for j in range(0, total_pending, bf_batch_size):
                 if t_sentiment_start is not None and (time.monotonic() - t_sentiment_start) >= sentiment_timeout_seconds:
-                    logger.warning("Tracker %s backfill: time guard reached mid-batch.", tracker_id)
+                    logger.warning("Tracker %s backfill: 90s time guard reached mid-pass.", tracker_id)
                     break
                 if sentiments_analyzed_this_cycle >= max_sentiment_per_cycle:
                     break
+                if gemini_cooldown_minutes_remaining() > 0:
+                    break
 
-                bf_batch = to_analyze[j : j + bf_batch_size]
+                bf_batch = pending_posts[j : j + bf_batch_size]
                 if t_sentiment_start is None:
                     t_sentiment_start = time.monotonic()
 
@@ -457,8 +487,10 @@ async def _execute_cycle() -> dict[str, Any]:
                         logger.error("Tracker %s backfill: upsert_sentiments_batch failed — %s", tracker_id, exc)
                 else:
                     logger.warning("Tracker %s backfill: Gemini batch failed for %d posts.", tracker_id, len(bf_batch))
+                    break  # Gemini is likely in trouble; stop this tracker's pass
 
             tracker_backfill_counts[tracker_id] = bf_analyzed
+            # We only fetched up to tracker_backfill_budget; actual remaining unknown
             tracker_still_awaiting[tracker_id] = max(0, total_pending - bf_analyzed)
 
             if bf_analyzed > 0:
@@ -469,8 +501,10 @@ async def _execute_cycle() -> dict[str, Any]:
                     logger.error("Tracker %s backfill: analytics failed — %s", tracker_id, exc)
 
     # -----------------------------------------------------------------------
-    # Log per-tracker cycle summary: analyzed this cycle, still awaiting
+    # Per-cycle summary log: awaiting sentiment per tracker, analyzed, cooldown
     # -----------------------------------------------------------------------
+    cooldown_mins_final = gemini_cooldown_minutes_remaining()
+    cooldown_status = f"cooldown={cooldown_mins_final:.1f}min" if cooldown_mins_final > 0 else "cooldown=none"
     for tracker in trackers:
         tid = tracker["id"]
         query = tracker.get("query", tid)
@@ -480,8 +514,11 @@ async def _execute_cycle() -> dict[str, Any]:
             tracker_deferred_ingest.get(tid, 0),
         )
         logger.info(
-            "Tracker %s ('%s'): %d analyzed this cycle, %d still awaiting.",
-            tid, query, analyzed_count, awaiting_count,
+            "CYCLE SUMMARY tracker=%s ('%s'): awaiting=%s analyzed_this_cycle=%d %s.",
+            tid, query,
+            "unknown" if awaiting_count == -1 else awaiting_count,
+            analyzed_count,
+            cooldown_status,
         )
 
     cycle_elapsed = time.monotonic() - t_cycle_start

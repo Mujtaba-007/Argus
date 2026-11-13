@@ -157,3 +157,11 @@ def generate_text(prompt: str) -> str:
 async def generate_text_async(prompt: str) -> str:
     """Async wrapper — runs generate_text in a thread pool to avoid blocking."""
     return await asyncio.to_thread(generate_text, prompt)
+
+
+def gemini_cooldown_minutes_remaining() -> float:
+    """Return minutes remaining in the active Gemini cooldown, or 0.0 if none."""
+    if not _is_cooldown_active() or _cooldown_until is None:
+        return 0.0
+    remaining = (_cooldown_until - datetime.utcnow()).total_seconds()
+    return max(0.0, remaining / 60.0)
