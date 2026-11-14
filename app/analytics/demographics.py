@@ -15,8 +15,8 @@ from typing import Any
 from app.config import settings
 from app.db.analytics_repository import (
     get_all_author_profiles,
-    get_author_sample_posts,
     get_authors_needing_profile,
+    get_authors_sample_posts_batch,
     replace_demographics_agg,
     upsert_author_profiles_batch,
 )
@@ -368,12 +368,11 @@ def analyze_demographics(tracker_id: str) -> dict[str, Any]:
     # Step 2: build per-author profiles
     hashes = [c["author_hash"] for c in candidates]
 
-    # Fetch sample posts for all authors
-    author_texts: dict[str, list[str]] = {}
-    for h in hashes:
-        texts = get_author_sample_posts(tracker_id, h, n=10)
-        if texts:
-            author_texts[h] = texts
+    # Fetch sample posts for all selected authors in batched 'in' queries (chunked at 200)
+    fetched_map = get_authors_sample_posts_batch(tracker_id, hashes, n=10)
+    author_texts: dict[str, list[str]] = {
+        h: fetched_map[h] for h in hashes if fetched_map.get(h)
+    }
 
     # Local inference: language + region (deterministic, no external calls)
     local_profiles: dict[str, dict[str, Any]] = {}

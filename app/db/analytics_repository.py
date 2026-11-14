@@ -342,6 +342,36 @@ def get_author_sample_posts(tracker_id: str, author_hash: str, n: int = 10) -> l
 
 
 @_db_retry
+def get_authors_sample_posts_batch(
+    tracker_id: str, author_hashes: list[str], n: int = 10
+) -> dict[str, list[str]]:
+    """Fetch up to n most recent post bodies per author in batched 'in' queries (chunked at 200). Never logs bodies."""
+    if not author_hashes:
+        return {}
+    chunk_size = 200
+    grouped: dict[str, list[str]] = {}
+    for i in range(0, len(author_hashes), chunk_size):
+        chunk = author_hashes[i : i + chunk_size]
+        res = (
+            supabase.table("posts")
+            .select("author_hash, body")
+            .eq("tracker_id", tracker_id)
+            .in_("author_hash", chunk)
+            .order("posted_at", desc=True)
+            .limit(1000)
+            .execute()
+        )
+        for r in (res.data or []):
+            h = r.get("author_hash")
+            body = r.get("body")
+            if h and body:
+                bucket = grouped.setdefault(h, [])
+                if len(bucket) < n:
+                    bucket.append(body)
+    return grouped
+
+
+@_db_retry
 def upsert_author_profiles_batch(profiles: list[dict[str, Any]]) -> None:
     """Upsert author_profiles rows (hashes only, no raw text)."""
     if not profiles:
