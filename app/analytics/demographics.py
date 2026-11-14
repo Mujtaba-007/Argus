@@ -20,7 +20,14 @@ from app.db.analytics_repository import (
     replace_demographics_agg,
     upsert_author_profiles_batch,
 )
-from app.nlp.gemini_client import generate_text
+from google.api_core.exceptions import ResourceExhausted
+
+from app.nlp.gemini_client import (
+    GeminiBudgetTimeout,
+    gemini_cooldown_minutes_remaining,
+    gemini_cooldown_until,
+    generate_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,10 +201,30 @@ Samples:
 """
 
 
+_cooldown_logged_for: datetime | None = None  # cooldown end we already logged
+
+
+def _skip_for_cooldown(tracker_id: str) -> bool:
+    """True if Gemini is in cooldown. Logs once per cooldown episode, not per batch."""
+    global _cooldown_logged_for
+    mins = gemini_cooldown_minutes_remaining()
+    if mins <= 0:
+        return False
+    until = gemini_cooldown_until()
+    if until != _cooldown_logged_for:
+        _cooldown_logged_for = until
+        logger.info(
+            "Demographics %s: Gemini in cooldown for %.1f more minutes; skipping age/interest inference.",
+            tracker_id, mins,
+        )
+    return True
+
+
 def _call_gemini_demo_batch(
     author_hashes: list[str], sample_texts: list[list[str]]
-) -> list[dict[str, Any]]:
-    """Call Gemini for age/interest inference. Returns list aligned with input."""
+) -> list[dict[str, Any]] | None:
+    """Call Gemini for age/interest inference. Returns list aligned with input,
+    or None if Gemini is out of quota / in cooldown (caller should stop)."""
     n = len(author_hashes)
     samples_block = ""
     for i, texts in enumerate(sample_texts):
@@ -207,10 +234,10 @@ def _call_gemini_demo_batch(
 
     prompt = _DEMO_PROMPT_TEMPLATE.format(n=n, samples=samples_block)
     try:
-        raw = generate_text(prompt)
+        raw = generate_text(prompt, priority="low")
         # Strip markdown fences if present
         raw = re.sub(r"```[a-z]*", "", raw).strip().strip("`").strip()
-        parsed = json.loads(raw)
+        parsed = json.loads(raw, strict=False)
         if not isinstance(parsed, list) or len(parsed) != n:
             logger.warning("Gemini demographics: unexpected response shape")
             return [{} for _ in range(n)]
@@ -225,8 +252,13 @@ def _call_gemini_demo_batch(
                 "confidence": round(min(max(conf, 0.0), 1.0), 3),
             })
         return results
+    except ResourceExhausted:
+        return None
+    except GeminiBudgetTimeout as exc:
+        logger.info("Gemini demographics: %s; stopping age/interest inference for this run.", exc)
+        return None
     except Exception as exc:
-        logger.warning("Gemini demographics batch failed: %s", type(exc).__name__)
+        logger.warning("Gemini demographics batch failed: %s: %s", type(exc).__name__, str(exc)[:200])
         return [{} for _ in range(n)]
 
 
@@ -367,14 +399,21 @@ def analyze_demographics(tracker_id: str) -> dict[str, Any]:
         tracker_id, matched_region_count, len(author_texts),
     )
 
-    # Gemini inference: age + interest in batches of ~15
-    rpm_delay = 60.0 / max(settings.gemini_max_rpm, 1)
+    # Gemini inference: age + interest in batches of ~15.
+    # Pacing is done by the shared Gemini budget in gemini_client (low priority =
+    # at most half of gemini_max_rpm), so no fixed sleep here.
     valid_hashes = list(author_texts.keys())
 
     for i in range(0, len(valid_hashes), _GEMINI_DEMO_BATCH):
+        if _skip_for_cooldown(tracker_id):
+            break
         batch_hashes = valid_hashes[i: i + _GEMINI_DEMO_BATCH]
         batch_texts = [author_texts[h] for h in batch_hashes]
         results = _call_gemini_demo_batch(batch_hashes, batch_texts)
+        if results is None:
+            # Quota hit during this batch; gemini_client started a cooldown.
+            _skip_for_cooldown(tracker_id)
+            break
         for h, res in zip(batch_hashes, results):
             if res:  # empty dict means Gemini failed for this batch
                 local_profiles[h]["age_bracket"] = res.get("age_bracket")
@@ -383,8 +422,6 @@ def analyze_demographics(tracker_id: str) -> dict[str, Any]:
                 local_profiles[h]["confidence"] = round(
                     (1.0 + res.get("confidence", 0.5)) / 2.0, 3
                 )
-        if i + _GEMINI_DEMO_BATCH < len(valid_hashes):
-            time.sleep(rpm_delay)  # respect GEMINI_MAX_RPM
 
     profiled = list(local_profiles.values())
 

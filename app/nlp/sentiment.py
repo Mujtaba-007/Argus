@@ -227,9 +227,11 @@ async def analyze_batch_async(texts: list[str]) -> list[SentimentResult] | None:
             logger.warning("Gemini batch response was not an array: %.80s", raw_response)
 
     except Exception as exc:
+        # Log length + head + tail so a genuinely truncated response is distinguishable
+        # from a log-formatting cut (the old %.100s cut every raw response at 100 chars).
         logger.warning(
-            "Failed to parse Gemini batch response: %s | raw: %.100s. Marking batch items as unclassified.",
-            exc, raw_response,
+            "Failed to parse Gemini batch response: %s | len=%d | head: %.300s | tail: %s. Marking batch items as unclassified.",
+            exc, len(raw_response or ""), raw_response, (raw_response or "")[-120:],
         )
 
     return results
