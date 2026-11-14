@@ -403,9 +403,18 @@ def analyze_demographics(tracker_id: str) -> dict[str, Any]:
     # Pacing is done by the shared Gemini budget in gemini_client (low priority =
     # at most half of gemini_max_rpm), so no fixed sleep here.
     valid_hashes = list(author_texts.keys())
+    demo_timeout_s = getattr(settings, "demo_gemini_timeout_seconds", 180.0)
+    t_demo_gemini_start = time.monotonic()
 
     for i in range(0, len(valid_hashes), _GEMINI_DEMO_BATCH):
         if _skip_for_cooldown(tracker_id):
+            break
+        elapsed = time.monotonic() - t_demo_gemini_start
+        if elapsed >= demo_timeout_s:
+            logger.warning(
+                "Demographics %s: Gemini time budget reached (%.1fs >= %.1fs). Stopping further batches (%d/%d authors done).",
+                tracker_id, elapsed, demo_timeout_s, i, len(valid_hashes),
+            )
             break
         batch_hashes = valid_hashes[i: i + _GEMINI_DEMO_BATCH]
         batch_texts = [author_texts[h] for h in batch_hashes]

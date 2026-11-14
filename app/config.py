@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     # Demographics settings
     demo_authors_per_run: int = 150    # Max authors profiled per tracker per run
     min_group_size: int = 10           # Minimum bucket size before merging into "Other (small groups)"
+    demo_gemini_timeout_seconds: float = 180.0  # Max seconds spent on Gemini demographics per run
 
     model_config = SettingsConfigDict(
         env_file=".env",          # Read from .env in the working directory
